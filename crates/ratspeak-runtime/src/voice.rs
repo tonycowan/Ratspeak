@@ -1052,6 +1052,12 @@ async fn drive_voice_events(
             }
             TelephonyServiceEvent::MediaReceived { .. }
             | TelephonyServiceEvent::OpusFramesReceived { .. }
+            | TelephonyServiceEvent::Codec2FramesReceived { .. }
+            | TelephonyServiceEvent::Codec2TransmitStreamStarted { .. }
+            | TelephonyServiceEvent::Codec2TransmitStreamStopped { .. }
+            | TelephonyServiceEvent::Codec2ReceiveStreamStarted { .. }
+            | TelephonyServiceEvent::Codec2ReceiveStreamStopped { .. }
+            | TelephonyServiceEvent::Codec2ReceiveStreamFrames { .. }
             | TelephonyServiceEvent::Drive(_) => {}
         }
     }

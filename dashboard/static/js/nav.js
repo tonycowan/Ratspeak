@@ -566,6 +566,7 @@ function showAboutModal() {
             '</div>' +
             '<div class="modal-body about-modal-body">' +
                 '<p class="font-600 about-modal-title">Ratspeak <span class="mono text-muted-color about-modal-version" id="about-modal-version"></span></p>' +
+                '<p class="mono text-muted-color about-modal-codec2">Codec2</p>' +
                 '<p>Real-time dashboard for Reticulum mesh networks. Encrypted messaging, dynamic node management, and network health monitoring.</p>' +
                 '<p class="about-modal-link-row">' +
                     '<a href="https://ratspeak.org" target="_blank" rel="noopener" class="text-link">ratspeak.org</a>' +
