@@ -8,7 +8,9 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use lxst_core::{CallRole, Profile, RawAudioFrame, SignallingStatus, TELEPHONY_DESTINATION_NAME};
+use lxst_core::{
+    AudioCodec, CallRole, Profile, RawAudioFrame, SignallingStatus, TELEPHONY_DESTINATION_NAME,
+};
 use lxst_telephony::{
     ActiveCallSnapshot, TelephonyControl, TelephonyRnsEndpoint, TelephonyRuntimeCore,
     TelephonyRuntimeSnapshot, TelephonyService, TelephonyServiceEvent,
@@ -59,6 +61,65 @@ const VOICE_OUTPUT_GAIN: f32 = 1.85;
 const VOICE_OUTPUT_LIMIT: f32 = 0.98;
 const VOICE_OUTPUT_LIMIT_CURVE: f32 = 0.35;
 const VOICE_INITIAL_PROFILE: Profile = Profile::QualityHigh;
+
+fn profile_uses_codec2(profile: Profile) -> bool {
+    matches!(profile.audio_codec(), AudioCodec::Codec2(_))
+}
+
+fn voice_initial_profile() -> Profile {
+    voice_profile_from_env().unwrap_or(VOICE_INITIAL_PROFILE)
+}
+
+fn voice_profile_from_env() -> Option<Profile> {
+    let raw = std::env::var("RATSPEAK_VOICE_PROFILE").ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "bandwidth_ultra_low" | "bandwidth-ultra-low" | "ulbw" => {
+            Some(Profile::BandwidthUltraLow)
+        }
+        "bandwidth_very_low" | "bandwidth-very-low" | "vlbw" => Some(Profile::BandwidthVeryLow),
+        "bandwidth_low" | "bandwidth-low" | "lbw" | "codec2" => Some(Profile::BandwidthLow),
+        "quality_medium" | "quality-medium" => Some(Profile::QualityMedium),
+        "quality_high" | "quality-high" => Some(Profile::QualityHigh),
+        "quality_max" | "quality-max" => Some(Profile::QualityMax),
+        "latency_low" | "latency-low" => Some(Profile::LatencyLow),
+        "latency_ultra_low" | "latency-ultra-low" => Some(Profile::LatencyUltraLow),
+        _ => None,
+    }
+}
+
+async fn stop_transmit_stream(control_tx: &mpsc::Sender<TelephonyControl>, profile: Profile) {
+    let control = if profile_uses_codec2(profile) {
+        TelephonyControl::StopCodec2Stream
+    } else {
+        TelephonyControl::StopOpusStream
+    };
+    let _ = control_tx.send(control).await;
+}
+
+async fn stop_receive_stream(control_tx: &mpsc::Sender<TelephonyControl>, profile: Profile) {
+    let control = if profile_uses_codec2(profile) {
+        TelephonyControl::StopCodec2ReceiveStream
+    } else {
+        TelephonyControl::StopOpusReceiveStream
+    };
+    let _ = control_tx.send(control).await;
+}
+
+async fn start_receive_stream(
+    control_tx: &mpsc::Sender<TelephonyControl>,
+    profile: Profile,
+    speaker_tx: mpsc::Sender<RawAudioFrame>,
+) -> Result<(), String> {
+    let control = if profile_uses_codec2(profile) {
+        TelephonyControl::StartCodec2ReceiveStream { frames: speaker_tx }
+    } else {
+        TelephonyControl::StartOpusReceiveStream { frames: speaker_tx }
+    };
+    control_tx
+        .send(control)
+        .await
+        .map_err(|e| format!("Failed to start LXST speaker stream: {e}"))
+}
 const LXMF_DELIVERY_DESTINATION_NAME: &str = "lxmf.delivery";
 const VOICE_CONTACTS_ONLY_NOTICE: &str = "I'm only accepting calls from contacts.";
 const VOICE_REJECTED_CALL_BLACKHOLE_THRESHOLD: u32 = 10;
@@ -260,7 +321,7 @@ pub async fn call_identity(state: &Arc<AppState>, remote_identity: [u8; 16]) -> 
         state,
         TelephonyControl::Call {
             remote_identity,
-            profile: Some(VOICE_INITIAL_PROFILE),
+            profile: Some(voice_initial_profile()),
             discovery_timeout: Duration::from_secs(15),
         },
     )
@@ -269,7 +330,7 @@ pub async fn call_identity(state: &Arc<AppState>, remote_identity: [u8; 16]) -> 
         "ok": true,
         "remote_identity": hex::encode(remote_identity),
         "remote_lxmf_destination": lxmf_destination_for_identity(remote_identity),
-        "profile": profile_key(VOICE_INITIAL_PROFILE),
+        "profile": profile_key(voice_initial_profile()),
     }))
 }
 
@@ -1016,6 +1077,55 @@ async fn drive_voice_events(
                     }),
                 );
             }
+            TelephonyServiceEvent::Codec2TransmitStreamStarted { link_id, profile } => {
+                emit_media_state(&state, "mic_started", link_id, profile, None);
+            }
+            TelephonyServiceEvent::Codec2TransmitStreamStopped {
+                link_id,
+                profile,
+                reason,
+            } => {
+                emit_media_state(
+                    &state,
+                    "mic_stopped",
+                    link_id,
+                    profile,
+                    Some(format!("{reason:?}")),
+                );
+            }
+            TelephonyServiceEvent::Codec2ReceiveStreamStarted { link_id, profile } => {
+                emit_media_state(&state, "speaker_started", link_id, profile, None);
+            }
+            TelephonyServiceEvent::Codec2ReceiveStreamStopped {
+                link_id,
+                profile,
+                reason,
+            } => {
+                emit_media_state(
+                    &state,
+                    "speaker_stopped",
+                    link_id,
+                    profile,
+                    Some(format!("{reason:?}")),
+                );
+            }
+            TelephonyServiceEvent::Codec2ReceiveStreamFrames {
+                link_id,
+                profile,
+                frames,
+                dropped,
+            } => {
+                state.emit_to_all(
+                    "voice_call_update",
+                    json!({
+                        "type": "speaker_frames",
+                        "link_id": hex::encode(link_id),
+                        "profile": profile_key(profile),
+                        "frames": frames,
+                        "dropped": dropped,
+                    }),
+                );
+            }
             TelephonyServiceEvent::Error { message } => {
                 state.emit_to_all(
                     "voice_call_update",
@@ -1053,11 +1163,6 @@ async fn drive_voice_events(
             TelephonyServiceEvent::MediaReceived { .. }
             | TelephonyServiceEvent::OpusFramesReceived { .. }
             | TelephonyServiceEvent::Codec2FramesReceived { .. }
-            | TelephonyServiceEvent::Codec2TransmitStreamStarted { .. }
-            | TelephonyServiceEvent::Codec2TransmitStreamStopped { .. }
-            | TelephonyServiceEvent::Codec2ReceiveStreamStarted { .. }
-            | TelephonyServiceEvent::Codec2ReceiveStreamStopped { .. }
-            | TelephonyServiceEvent::Codec2ReceiveStreamFrames { .. }
             | TelephonyServiceEvent::Drive(_) => {}
         }
     }
@@ -1153,16 +1258,6 @@ async fn reconcile_audio_session(
     }
 
     let profile = active.profile.unwrap_or(Profile::DEFAULT);
-    if profile.opus_payload_ceiling_bytes().is_none() {
-        state.emit_to_all(
-            "voice_call_update",
-            json!({
-                "type": "error",
-                "message": "Only Opus LXST voice profiles are supported by the live audio bridge",
-            }),
-        );
-        return;
-    }
 
     let current_matches = audio_session
         .as_ref()
@@ -1294,12 +1389,10 @@ async fn stop_audio_session(
 ) {
     if let Some(session) = session {
         if session.microphone {
-            let _ = control_tx.send(TelephonyControl::StopOpusStream).await;
+            stop_transmit_stream(control_tx, session.profile).await;
         }
         if session.speaker {
-            let _ = control_tx
-                .send(TelephonyControl::StopOpusReceiveStream)
-                .await;
+            stop_receive_stream(control_tx, session.profile).await;
         }
         drop(session);
     }
@@ -1713,7 +1806,7 @@ impl VoiceAudioSession {
                 .is_some_and(|retry_at| now >= retry_at)
         {
             let host = cpal::default_host();
-            match start_speaker_side(&host, control_tx, self.profile.sample_rate_hz()).await {
+            match start_speaker_side(&host, self.profile, control_tx, self.profile.sample_rate_hz()).await {
                 Ok((stream, sink_task)) => {
                     tracing::info!(
                         link_id = %hex::encode(self.link_id),
@@ -1753,12 +1846,10 @@ impl VoiceAudioSession {
         let had_microphone = self.microphone;
         let had_speaker = self.speaker;
         if self.microphone {
-            let _ = control_tx.send(TelephonyControl::StopOpusStream).await;
+            stop_transmit_stream(&control_tx, self.profile).await;
         }
         if self.speaker {
-            let _ = control_tx
-                .send(TelephonyControl::StopOpusReceiveStream)
-                .await;
+            stop_receive_stream(&control_tx, self.profile).await;
         }
         if let Some(task) = self.sink_task.take() {
             await_or_abort(task).await;
@@ -1796,7 +1887,7 @@ impl VoiceAudioSession {
             }
         }
 
-        match start_speaker_side(&host, control_tx, target_sample_rate).await {
+        match start_speaker_side(&host, self.profile, control_tx, target_sample_rate).await {
             Ok((stream, sink_task)) => {
                 self._output_stream = Some(stream);
                 self.sink_task = Some(sink_task);
@@ -1854,7 +1945,7 @@ impl VoiceAudioSession {
         };
 
         let (output_stream, sink_task) =
-            match start_speaker_side(&host, control_tx, target_sample_rate).await {
+            match start_speaker_side(&host, profile, control_tx, target_sample_rate).await {
                 Ok((stream, sink_task)) => (Some(stream), Some(sink_task)),
                 Err(message) => {
                     warnings.push(message);
@@ -1921,13 +2012,21 @@ async fn start_microphone_side(
         .play()
         .map_err(|e| format!("Failed to start microphone stream: {e}"))?;
 
-    if let Err(e) = control_tx
-        .send(TelephonyControl::StartOpusStream {
-            profile,
-            frames: capture_rx,
-        })
-        .await
-    {
+    if let Err(e) = if profile_uses_codec2(profile) {
+        control_tx
+            .send(TelephonyControl::StartCodec2Stream {
+                profile,
+                frames: capture_rx,
+            })
+            .await
+    } else {
+        control_tx
+            .send(TelephonyControl::StartOpusStream {
+                profile,
+                frames: capture_rx,
+            })
+            .await
+    } {
         return Err(format!("Failed to start LXST microphone stream: {e}"));
     }
 
@@ -1936,13 +2035,14 @@ async fn start_microphone_side(
 
 async fn start_speaker_side(
     host: &cpal::Host,
+    profile: Profile,
     control_tx: mpsc::Sender<TelephonyControl>,
     target_sample_rate: u32,
 ) -> VoiceResult<(VoiceOutputStream, JoinHandle<()>)> {
     #[cfg(target_os = "android")]
     {
         let _ = host;
-        return start_android_speaker_side(control_tx, target_sample_rate).await;
+        return start_android_speaker_side(profile, control_tx, target_sample_rate).await;
     }
 
     #[cfg(not(target_os = "android"))]
@@ -1993,12 +2093,9 @@ async fn start_speaker_side(
             return Err(format!("Failed to start speaker stream: {e}"));
         }
 
-        if let Err(e) = control_tx
-            .send(TelephonyControl::StartOpusReceiveStream { frames: speaker_tx })
-            .await
-        {
+        if let Err(e) = start_receive_stream(&control_tx, profile, speaker_tx).await {
             sink_task.abort();
-            return Err(format!("Failed to start LXST speaker stream: {e}"));
+            return Err(e);
         }
 
         Ok((output_stream, sink_task))
@@ -2007,6 +2104,7 @@ async fn start_speaker_side(
 
 #[cfg(target_os = "android")]
 async fn start_android_speaker_side(
+    profile: Profile,
     control_tx: mpsc::Sender<TelephonyControl>,
     target_sample_rate: u32,
 ) -> VoiceResult<(AndroidVoiceOutput, JoinHandle<()>)> {
@@ -2046,13 +2144,10 @@ async fn start_android_speaker_side(
         }
     });
 
-    if let Err(e) = control_tx
-        .send(TelephonyControl::StartOpusReceiveStream { frames: speaker_tx })
-        .await
-    {
+    if let Err(e) = start_receive_stream(&control_tx, profile, speaker_tx).await {
         sink_task.abort();
         android_voice_audio::stop();
-        return Err(format!("Failed to start LXST Android speaker stream: {e}"));
+        return Err(e);
     }
 
     Ok((AndroidVoiceOutput, sink_task))
@@ -3056,6 +3151,14 @@ mod tests {
         let converted = resample_output_frame(&frame, 24_000, 48_000, 2);
 
         assert_eq!(converted.len(), 2_880 * 2);
+    }
+
+    #[test]
+    fn profile_uses_codec2_matches_bandwidth_profiles() {
+        assert!(profile_uses_codec2(Profile::BandwidthLow));
+        assert!(profile_uses_codec2(Profile::BandwidthVeryLow));
+        assert!(!profile_uses_codec2(Profile::QualityHigh));
+        assert!(!profile_uses_codec2(Profile::LatencyLow));
     }
 
     #[test]
