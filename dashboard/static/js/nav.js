@@ -566,7 +566,7 @@ function showAboutModal() {
             '</div>' +
             '<div class="modal-body about-modal-body">' +
                 '<p class="font-600 about-modal-title">Ratspeak <span class="mono text-muted-color about-modal-version" id="about-modal-version"></span></p>' +
-                '<p class="mono text-muted-color about-modal-codec2">Codec2</p>' +
+                '<p class="mono text-muted-color about-modal-build-label" id="about-modal-build-label" hidden></p>' +
                 '<p>Real-time dashboard for Reticulum mesh networks. Encrypted messaging, dynamic node management, and network health monitoring.</p>' +
                 '<p class="about-modal-link-row">' +
                     '<a href="https://ratspeak.org" target="_blank" rel="noopener" class="text-link">ratspeak.org</a>' +
@@ -581,6 +581,17 @@ function showAboutModal() {
         var version = data && data.version ? String(data.version) : '';
         var versionEl = document.getElementById('about-modal-version');
         if (versionEl && version) versionEl.textContent = 'v.' + version;
+        var buildLabel = data && data.build_label ? String(data.build_label) : '';
+        var buildLabelEl = document.getElementById('about-modal-build-label');
+        if (buildLabelEl) {
+            if (buildLabel) {
+                buildLabelEl.textContent = buildLabel;
+                buildLabelEl.hidden = false;
+            } else {
+                buildLabelEl.textContent = '';
+                buildLabelEl.hidden = true;
+            }
+        }
     }).catch(function() {});
 
     function close() { overlay.remove(); }

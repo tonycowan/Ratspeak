@@ -7,6 +7,7 @@
 // `Send` bounds or stalls the executor.
 #![warn(clippy::await_holding_lock)]
 
+pub mod codec2_build;
 pub mod commands;
 pub mod config;
 pub mod emitter;

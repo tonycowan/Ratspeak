@@ -1424,6 +1424,9 @@
 .settings-version-label {
     min-width: 0;
 }
+.settings-build-label {
+    flex-basis: 100%;
+}
 .settings-update-check-btn {
     appearance: none;
     border: 1px solid var(--accent-border);

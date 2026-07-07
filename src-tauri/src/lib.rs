@@ -1,5 +1,8 @@
 mod paths;
 
+#[cfg(all(not(any(target_os = "android", target_os = "ios"))))]
+mod desktop_menu;
+
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use tauri::webview::DownloadEvent;
 use tauri::Manager;
@@ -460,6 +463,10 @@ pub fn run() {
         tracing::info!("[haptics] tauri-plugin-haptics registered");
         b
     };
+
+    #[cfg(all(not(any(target_os = "android", target_os = "ios"))))]
+    let builder =
+        builder.menu(|handle| desktop_menu::default_with_codec2_about(handle));
 
     builder
         .invoke_handler(tauri::generate_handler![

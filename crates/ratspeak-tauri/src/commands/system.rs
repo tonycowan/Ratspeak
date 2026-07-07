@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tauri::State;
 
+use crate::codec2_build::BUILD_LABEL;
 use crate::commands::shared::{active_rns_config_dir, remove_stored_file_refs};
 use crate::db;
 use crate::error::{AppError, AppResult};
@@ -29,7 +30,11 @@ fn app_display_version() -> &'static str {
 
 #[tauri::command]
 pub async fn api_version() -> AppResult<Value> {
-    Ok(json!({ "version": app_display_version(), "name": "Ratspeak" }))
+    Ok(json!({
+        "version": app_display_version(),
+        "name": "Ratspeak",
+        "build_label": BUILD_LABEL,
+    }))
 }
 
 #[tauri::command]

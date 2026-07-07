@@ -14,6 +14,7 @@ function openSettings() {
 
 var _settingsVersionLabel = '';
 var _settingsVersionValue = '';
+var _settingsBuildLabel = '';
 var _settingsUpdateCheckInFlight = false;
 var _settingsDeveloperModeBound = false;
 var _settingsDeveloperModeStorageKey = 'ratspeak-developer-mode-enabled';
@@ -83,7 +84,7 @@ function renderSettingsVersion() {
     ].filter(Boolean);
     if (!targets.length) return;
 
-    function paint(label, version) {
+    function paint(label, version, buildLabel) {
         targets.forEach(function(el) {
             el.innerHTML = '';
             if (label) {
@@ -91,6 +92,13 @@ function renderSettingsVersion() {
                 versionLabel.className = 'settings-version-label';
                 versionLabel.textContent = label;
                 el.appendChild(versionLabel);
+
+                if (buildLabel) {
+                    var buildLabelEl = document.createElement('span');
+                    buildLabelEl.className = 'settings-build-label mono text-muted-color';
+                    buildLabelEl.textContent = buildLabel;
+                    el.appendChild(buildLabelEl);
+                }
 
                 var button = document.createElement('button');
                 button.type = 'button';
@@ -107,7 +115,7 @@ function renderSettingsVersion() {
     }
 
     if (_settingsVersionLabel) {
-        paint(_settingsVersionLabel, _settingsVersionValue);
+        paint(_settingsVersionLabel, _settingsVersionValue, _settingsBuildLabel);
         return;
     }
 
@@ -117,9 +125,10 @@ function renderSettingsVersion() {
         if (!version) return;
         _settingsVersionValue = version;
         _settingsVersionLabel = name + ' v.' + version;
-        paint(_settingsVersionLabel, _settingsVersionValue);
+        _settingsBuildLabel = (data && data.build_label) ? String(data.build_label) : '';
+        paint(_settingsVersionLabel, _settingsVersionValue, _settingsBuildLabel);
     }).catch(function() {
-        paint('', '');
+        paint('', '', '');
     });
 }
 

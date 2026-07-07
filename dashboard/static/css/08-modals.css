@@ -1683,7 +1683,8 @@
 .about-modal-version {
     font-weight: var(--type-weight-regular);
 }
-.about-modal-codec2 {
+.about-modal-codec2,
+.about-modal-build-label {
     margin: 0 0 var(--space-4);
 }
 .about-modal-link-row {
