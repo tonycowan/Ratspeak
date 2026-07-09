@@ -1412,6 +1412,20 @@
     gap: var(--space-3);
     flex-wrap: wrap;
 }
+.settings-sidebar-voice,
+.settings-voice-profile-system {
+    color: var(--text-muted);
+    font-size: var(--text-xs);
+    line-height: 1.35;
+    user-select: text;
+}
+.settings-sidebar-voice {
+    margin: var(--space-2) var(--space-3) 0;
+}
+.settings-voice-profile-system {
+    margin-top: var(--space-4);
+    text-align: center;
+}
 .settings-sidebar-version {
     margin: var(--space-8) var(--space-3) 0;
     padding-top: var(--space-5);

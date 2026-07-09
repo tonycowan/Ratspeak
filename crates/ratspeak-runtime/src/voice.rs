@@ -58,6 +58,7 @@ const VOICE_AUDIO_RECOVERY_TICK: Duration = Duration::from_millis(1500);
 const VOICE_AUDIO_RECOVERY_INITIAL_DELAY: Duration = Duration::from_millis(750);
 const VOICE_AUDIO_RECOVERY_MAX_DELAY: Duration = Duration::from_secs(10);
 const VOICE_OUTPUT_GAIN: f32 = 1.85;
+const VOICE_CODEC2_OUTPUT_GAIN: f32 = 2.9;
 const VOICE_OUTPUT_LIMIT: f32 = 0.98;
 const VOICE_OUTPUT_LIMIT_CURVE: f32 = 0.35;
 const VOICE_INITIAL_PROFILE: Profile = Profile::QualityHigh;
@@ -66,8 +67,61 @@ fn profile_uses_codec2(profile: Profile) -> bool {
     matches!(profile.audio_codec(), AudioCodec::Codec2(_))
 }
 
+fn voice_output_gain(profile: Profile) -> f32 {
+    if profile_uses_codec2(profile) {
+        VOICE_CODEC2_OUTPUT_GAIN
+    } else {
+        VOICE_OUTPUT_GAIN
+    }
+}
+
 fn voice_initial_profile() -> Profile {
     voice_profile_from_env().unwrap_or(VOICE_INITIAL_PROFILE)
+}
+
+fn voice_profile_source() -> &'static str {
+    if voice_profile_from_env().is_some() {
+        "env"
+    } else {
+        "default"
+    }
+}
+
+fn voice_profile_codec_kind(profile: Profile) -> &'static str {
+    match profile.audio_codec() {
+        AudioCodec::Codec2(_) => "codec2",
+        AudioCodec::Opus(_) => "opus",
+    }
+}
+
+fn voice_profile_codec_detail(profile: Profile) -> String {
+    match profile.audio_codec() {
+        AudioCodec::Codec2(mode) => mode.bitrate().to_string(),
+        AudioCodec::Opus(_) => profile.abbreviation().to_string(),
+    }
+}
+
+fn voice_profile_label(profile: Profile) -> &'static str {
+    match profile {
+        Profile::BandwidthUltraLow => "Codec2 700C",
+        Profile::BandwidthVeryLow => "Codec2 1600",
+        Profile::BandwidthLow => "Codec2 3200",
+        Profile::QualityMedium => "Opus MQ",
+        Profile::QualityHigh => "Opus HQ",
+        Profile::QualityMax => "Opus Max",
+        Profile::LatencyLow => "Opus LL",
+        Profile::LatencyUltraLow => "Opus ULL",
+    }
+}
+
+fn voice_profile_status_fields(profile: Profile) -> Value {
+    json!({
+        "default_profile": profile_key(profile),
+        "profile_label": voice_profile_label(profile),
+        "codec": voice_profile_codec_kind(profile),
+        "codec_detail": voice_profile_codec_detail(profile),
+        "profile_source": voice_profile_source(),
+    })
 }
 
 fn voice_profile_from_env() -> Option<Profile> {
@@ -278,11 +332,18 @@ pub fn voice_status(state: &AppState) -> Value {
         .lock()
         .map(|voice| voice.is_some())
         .unwrap_or(false);
-    json!({
+    let profile = voice_initial_profile();
+    let mut status = json!({
         "enabled": true,
         "running": running,
         "microphone_muted": microphone_muted(),
-    })
+    });
+    if let Value::Object(fields) = voice_profile_status_fields(profile) {
+        if let Value::Object(status_map) = &mut status {
+            status_map.extend(fields);
+        }
+    }
+    status
 }
 
 pub fn set_microphone_muted(state: &AppState, muted: bool) -> VoiceResult<Value> {
@@ -326,11 +387,13 @@ pub async fn call_identity(state: &Arc<AppState>, remote_identity: [u8; 16]) -> 
         },
     )
     .await?;
+    let profile = voice_initial_profile();
     Ok(json!({
         "ok": true,
         "remote_identity": hex::encode(remote_identity),
         "remote_lxmf_destination": lxmf_destination_for_identity(remote_identity),
-        "profile": profile_key(voice_initial_profile()),
+        "profile": profile_key(profile),
+        "profile_label": voice_profile_label(profile),
     }))
 }
 
@@ -2066,6 +2129,7 @@ async fn start_speaker_side(
         let output_stream =
             build_output_stream(&output_device, &output_config, Arc::clone(&output_queue))?;
 
+        let output_gain = voice_output_gain(profile);
         let sink_task = tokio::spawn(async move {
             let mut fade_samples_remaining = fade_sample_count(output_sample_rate, output_channels);
             let fade_samples_total = fade_samples_remaining;
@@ -2081,7 +2145,7 @@ async fn start_speaker_side(
                     &mut fade_samples_remaining,
                     fade_samples_total,
                 );
-                apply_voice_output_leveling(&mut converted);
+                apply_voice_output_leveling(&mut converted, output_gain);
                 if let Ok(mut queue) = output_queue.lock() {
                     queue.push_samples(converted);
                 }
@@ -2114,6 +2178,7 @@ async fn start_android_speaker_side(
     android_voice_audio::start(ANDROID_OUTPUT_SAMPLE_RATE, ANDROID_OUTPUT_CHANNELS)?;
     let (speaker_tx, mut speaker_rx) = mpsc::channel::<RawAudioFrame>(AUDIO_SPEAKER_CHANNEL_DEPTH);
 
+    let output_gain = voice_output_gain(profile);
     let sink_task = tokio::task::spawn_blocking(move || {
         let mut fade_samples_remaining =
             fade_sample_count(ANDROID_OUTPUT_SAMPLE_RATE, ANDROID_OUTPUT_CHANNELS);
@@ -2130,7 +2195,7 @@ async fn start_android_speaker_side(
                 &mut fade_samples_remaining,
                 fade_samples_total,
             );
-            apply_voice_output_leveling(&mut converted);
+            apply_voice_output_leveling(&mut converted, output_gain);
             if let Err(err) = write_android_voice_samples(&converted) {
                 tracing::warn!(error = %err, "LXST Android voice output write failed");
                 if android_voice_audio::start(ANDROID_OUTPUT_SAMPLE_RATE, ANDROID_OUTPUT_CHANNELS)
@@ -2833,10 +2898,10 @@ fn apply_fade_in(samples: &mut [f32], remaining: &mut usize, total: usize) {
     *remaining -= count;
 }
 
-fn apply_voice_output_leveling(samples: &mut [f32]) {
+fn apply_voice_output_leveling(samples: &mut [f32], gain: f32) {
     for sample in samples {
         let boosted = if sample.is_finite() {
-            *sample * VOICE_OUTPUT_GAIN
+            *sample * gain
         } else {
             0.0
         };
@@ -3198,10 +3263,39 @@ mod tests {
     }
 
     #[test]
+    fn voice_output_gain_uses_higher_level_for_codec2_profiles() {
+        assert_eq!(voice_output_gain(Profile::QualityHigh), VOICE_OUTPUT_GAIN);
+        assert_eq!(voice_output_gain(Profile::BandwidthLow), VOICE_CODEC2_OUTPUT_GAIN);
+    }
+
+    #[test]
+    fn voice_profile_status_fields_describe_codec2_and_opus_profiles() {
+        assert_eq!(voice_profile_label(Profile::BandwidthVeryLow), "Codec2 1600");
+        assert_eq!(
+            voice_profile_codec_kind(Profile::BandwidthVeryLow),
+            "codec2"
+        );
+        assert_eq!(
+            voice_profile_codec_detail(Profile::BandwidthVeryLow),
+            "1600"
+        );
+        assert_eq!(voice_profile_label(Profile::QualityHigh), "Opus HQ");
+        assert_eq!(voice_profile_codec_kind(Profile::QualityHigh), "opus");
+        assert_eq!(voice_profile_codec_detail(Profile::QualityHigh), "HQ");
+
+        let fields = voice_profile_status_fields(Profile::BandwidthLow);
+        assert_eq!(fields["default_profile"], "bandwidth_low");
+        assert_eq!(fields["profile_label"], "Codec2 3200");
+        assert_eq!(fields["codec"], "codec2");
+        assert_eq!(fields["codec_detail"], "3200");
+        assert!(fields["profile_source"].is_string());
+    }
+
+    #[test]
     fn voice_output_leveling_lifts_quiet_samples_and_limits_peaks() {
         let mut samples = vec![0.0, 0.2, -0.2, 1.0, -1.0, f32::NAN];
 
-        apply_voice_output_leveling(&mut samples);
+        apply_voice_output_leveling(&mut samples, VOICE_OUTPUT_GAIN);
 
         assert_eq!(samples[0], 0.0);
         assert!(samples[1] > 0.2);

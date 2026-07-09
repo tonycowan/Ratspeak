@@ -48,6 +48,9 @@ var lxstVoiceState = {
     audioSpeaker: false,
     microphoneMuted: false,
     speakerphone: false,
+    defaultProfile: null,
+    defaultProfileLabel: null,
+    profileSource: null,
     lastAudioWarningKey: null,
     lastDialHash: null,
     lastError: null,
@@ -62,6 +65,64 @@ var _voiceNativeAudioRoutePrimed = false;
 var _voiceNativeAudioRouteLastSyncAt = 0;
 var _voiceSpeakerRestartToken = 0;
 var _voiceDialToken = 0;
+
+function _voiceProfileLabel(profileKey) {
+    if (!profileKey) return '';
+    switch (profileKey) {
+        case 'bandwidth_ultra_low': return 'Codec2 700C';
+        case 'bandwidth_very_low': return 'Codec2 1600';
+        case 'bandwidth_low': return 'Codec2 3200';
+        case 'quality_medium': return 'Opus MQ';
+        case 'quality_high': return 'Opus HQ';
+        case 'quality_max': return 'Opus Max';
+        case 'latency_low': return 'Opus LL';
+        case 'latency_ultra_low': return 'Opus ULL';
+        default: return String(profileKey).replace(/_/g, ' ');
+    }
+}
+
+function _voiceDefaultProfileKey() {
+    return lxstVoiceState.defaultProfile || null;
+}
+
+function _voiceCallProfileLabel(active) {
+    if (!active) return '';
+    var key = active.profile || _voiceDefaultProfileKey();
+    if (!key) return '';
+    if (key === lxstVoiceState.defaultProfile && lxstVoiceState.defaultProfileLabel) {
+        return lxstVoiceState.defaultProfileLabel;
+    }
+    return _voiceProfileLabel(key);
+}
+
+function _voiceCodecStatusSuffix(call) {
+    if (!call) return '';
+    var label = _voiceCallProfileLabel(call);
+    if (!label) return '';
+    if (call.status === 'established'
+        || call.status === 'connecting'
+        || call.status === 'calling'
+        || call.status === 'ringing'
+        || call.status === 'available') {
+        return ' \u00b7 ' + label;
+    }
+    return '';
+}
+
+function _voiceApplyVoiceStatus(status) {
+    if (!status || typeof status !== 'object') return;
+    lxstVoiceState.available = status.enabled !== false;
+    lxstVoiceState.running = !!status.running;
+    if (typeof status.microphone_muted === 'boolean') {
+        lxstVoiceState.microphoneMuted = status.microphone_muted;
+    }
+    if (status.default_profile) lxstVoiceState.defaultProfile = status.default_profile;
+    if (status.profile_label) lxstVoiceState.defaultProfileLabel = status.profile_label;
+    if (status.profile_source) lxstVoiceState.profileSource = status.profile_source;
+    if (typeof window.renderSettingsVoiceProfile === 'function') {
+        window.renderSettingsVoiceProfile();
+    }
+}
 
 function _voiceStatusLabel(status) {
     switch (status) {
@@ -192,6 +253,7 @@ function _voiceActiveStatusLabel(active) {
     var status = _voiceStatusLabel(active.status);
     var elapsed = _voiceElapsedLabel();
     if (elapsed) status += ' - ' + elapsed;
+    status += _voiceCodecStatusSuffix(active);
     return status;
 }
 
@@ -201,9 +263,13 @@ function _voiceGlobalStatusLabel(active) {
     if (audioIssue) return audioIssue;
     if (active.status === 'established') {
         var elapsed = _voiceElapsedLabel();
-        return 'Active call' + (elapsed ? ' - ' + elapsed : '');
+        var status = 'Active call' + (elapsed ? ' - ' + elapsed : '');
+        status += _voiceCodecStatusSuffix(active);
+        return status;
     }
-    return _voiceStatusLabel(active.status);
+    var status = _voiceStatusLabel(active.status);
+    status += _voiceCodecStatusSuffix(active);
+    return status;
 }
 
 function _voiceSyncElapsedTimer() {
@@ -464,7 +530,7 @@ function _voiceRenderCallSurface(ids) {
     if (statusEl) {
         var status = active
             ? (ids.global ? _voiceGlobalStatusLabel(active) : _voiceActiveStatusLabel(active))
-            : 'Incoming call';
+            : ('Incoming call' + (incoming ? _voiceCodecStatusSuffix(incoming) : ''));
         var audioIssue = active && !ids.global ? _voiceAudioIssueLabel() : '';
         if (audioIssue) status += ' - ' + audioIssue;
         statusEl.textContent = status;
@@ -562,7 +628,8 @@ function _voiceSetOptimisticOutgoing(hash) {
         remote_lxmf_destination: hash,
         requested_hash: hash,
         role: 'outgoing',
-        status: 'calling'
+        status: 'calling',
+        profile: _voiceDefaultProfileKey()
     };
     lxstVoiceState.incoming = null;
     lxstVoiceState.lastError = null;
@@ -587,6 +654,9 @@ function _voiceStartCall(hash) {
         return RS.invoke('voice_call', { args: { hash: hash } }).then(function(result) {
             if (dialToken !== _voiceDialToken || !_voiceActiveMatchesContact(hash)) return;
             if (result && result.requested_hash) lxstVoiceState.lastDialHash = result.requested_hash;
+            if (result && result.profile && lxstVoiceState.active) {
+                lxstVoiceState.active.profile = result.profile;
+            }
             renderVoiceUi();
         }).catch(function(err) {
             if (dialToken !== _voiceDialToken || !_voiceActiveMatchesContact(hash)) return;
@@ -853,7 +923,8 @@ function _voiceHandleUpdate(data) {
             link_id: data.link_id,
             remote_identity: data.remote_identity,
             remote_lxmf_destination: data.remote_lxmf_destination || null,
-            status: 'ringing'
+            status: 'ringing',
+            profile: data.profile || _voiceDefaultProfileKey()
         };
     } else if (data.type === 'outgoing_pending') {
         lxstVoiceState.active = {
@@ -861,7 +932,8 @@ function _voiceHandleUpdate(data) {
             remote_identity: data.remote_identity,
             remote_lxmf_destination: data.remote_lxmf_destination || null,
             role: 'outgoing',
-            status: 'calling'
+            status: 'calling',
+            profile: data.profile || _voiceDefaultProfileKey()
         };
         lxstVoiceState.incoming = null;
         lxstVoiceState.lastError = null;
@@ -872,7 +944,8 @@ function _voiceHandleUpdate(data) {
             remote_identity: data.remote_identity,
             remote_lxmf_destination: data.remote_lxmf_destination || null,
             role: 'outgoing',
-            status: 'calling'
+            status: 'calling',
+            profile: data.profile || _voiceDefaultProfileKey()
         };
         _voiceTrackEstablished(lxstVoiceState.active);
     } else if (data.type === 'snapshot') {
@@ -896,6 +969,17 @@ function _voiceHandleUpdate(data) {
         lxstVoiceState.audioSpeaker = !!(data.audio && data.audio.speaker);
         if (data.audio && typeof data.audio.microphone_muted === 'boolean') {
             lxstVoiceState.microphoneMuted = data.audio.microphone_muted;
+        }
+    } else if (data.type === 'profile_adaptation') {
+        if (lxstVoiceState.active
+            && data.link_id
+            && lxstVoiceState.active.link_id === data.link_id
+            && data.to) {
+            lxstVoiceState.active.profile = data.to;
+            var adaptedLabel = _voiceProfileLabel(data.to);
+            if (adaptedLabel) {
+                _voiceNotify('Voice codec: ' + adaptedLabel);
+            }
         }
     } else if (data.type === 'outgoing_failed') {
         var failedMessage = data.message || 'Call could not be connected';
@@ -921,6 +1005,12 @@ function _voiceHandleUpdate(data) {
         lxstVoiceState.audioSpeaker = !!data.speaker;
         if (typeof data.microphone_muted === 'boolean') {
             lxstVoiceState.microphoneMuted = data.microphone_muted;
+        }
+        if (lxstVoiceState.active
+            && data.link_id
+            && lxstVoiceState.active.link_id === data.link_id
+            && data.profile) {
+            lxstVoiceState.active.profile = data.profile;
         }
         if (lxstVoiceState.audioMicrophone && lxstVoiceState.audioSpeaker) {
             lxstVoiceState.lastAudioWarningKey = null;
@@ -4819,11 +4909,7 @@ document.addEventListener('DOMContentLoaded', function() {
     _voiceWireHangupProximity('lxst-call-strip', 'lxst-call-hangup-btn');
     _voiceWireHangupProximity('lxst-call-global', 'lxst-call-global-hangup-btn');
     RS.invoke('voice_status').then(function(status) {
-        lxstVoiceState.available = true;
-        lxstVoiceState.running = !!(status && status.running);
-        if (status && typeof status.microphone_muted === 'boolean') {
-            lxstVoiceState.microphoneMuted = status.microphone_muted;
-        }
+        _voiceApplyVoiceStatus(status);
         renderVoiceUi();
     }).catch(function() {
         lxstVoiceState.available = false;

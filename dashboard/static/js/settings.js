@@ -6,6 +6,7 @@ function openSettings() {
     initDeveloperModeToggle();
     syncSettingsIdentityActions();
     renderSettingsVersion();
+    renderSettingsVoiceProfile();
     // Re-seal every System reset subsection on each visit. The collapse IS the
     // safety feature for destructive ops — a stale-open Delete Data section
     // from a previous visit would defeat it.
@@ -131,6 +132,43 @@ function renderSettingsVersion() {
         paint('', '', '');
     });
 }
+
+function renderSettingsVoiceProfile() {
+    var targets = [
+        document.getElementById('settings-voice-profile-sidebar'),
+        document.getElementById('settings-voice-profile-system')
+    ].filter(Boolean);
+    if (!targets.length) return;
+
+    function paint(text) {
+        targets.forEach(function(el) {
+            el.textContent = text || '';
+            el.hidden = !text;
+            el.style.display = text ? '' : 'none';
+        });
+    }
+
+    RS.invoke('voice_status').then(function(status) {
+        if (!status || status.enabled === false) {
+            paint('');
+            return;
+        }
+        var label = status.profile_label || '';
+        if (!label && status.default_profile) {
+            label = String(status.default_profile).replace(/_/g, ' ');
+        }
+        if (!label) {
+            paint('');
+            return;
+        }
+        var source = status.profile_source === 'env' ? 'environment' : 'default';
+        paint('Voice: ' + label + ' (' + source + ')');
+    }).catch(function() {
+        paint('');
+    });
+}
+
+window.renderSettingsVoiceProfile = renderSettingsVoiceProfile;
 
 function _settingsNormalizeVersion(version) {
     return String(version || '')
@@ -1706,6 +1744,7 @@ document.addEventListener('DOMContentLoaded', function() {
     initHapticsToggle();
     initSettingsSectionNav();
     renderSettingsVersion();
+    renderSettingsVoiceProfile();
 });
 
 function updateBlockedCount() {

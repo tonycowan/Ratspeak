@@ -1367,6 +1367,13 @@ pub async fn init_rns_lxmf(state: Arc<AppState>, data_dir: std::path::PathBuf) {
                             "lxmf.delivery",
                             signing_key,
                         );
+                    // Python LXMF proves inside the delivery_packet callback.
+                    // Honor the same behavior with ProveAll so senders still get
+                    // link-packet delivery confirmation after we stopped auto-proving
+                    // for ProveNone destinations (telephony / LXST media).
+                    lxmf_link_mgr.set_proof_strategy(
+                        rns_identity::destination::ProofStrategy::ProveAll,
+                    );
 
                     let (link_pkt_tx, mut link_pkt_rx) =
                         tokio::sync::mpsc::channel::<(Vec<u8>, [u8; 16])>(CHANNEL_BUFFER_SIZE);
