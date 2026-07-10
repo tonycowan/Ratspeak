@@ -24,6 +24,9 @@ env:
   RATSPEAK_RSLXMF_REF: v1.0.1
   RATSPEAK_RSLXST_REF: ratspeak-v1.0.25
   RATSPEAK_LRGP_REF: ratspeak-v1.0.21
+  # Unchanged siblings can be pulled from upstream when absent on a fork.
+  RATSPEAK_RSLXMF_REPOSITORY: ratspeak/rsLXMF
+  RATSPEAK_LRGP_REPOSITORY: ratspeak/lrgp-rs
 
 jobs:
   build:
@@ -65,7 +68,7 @@ jobs:
       - name: Checkout rsLXMF
         uses: actions/checkout@v5
         with:
-          repository: ${{ github.repository_owner }}/rsLXMF
+          repository: ${{ env.RATSPEAK_RSLXMF_REPOSITORY }}
           ref: ${{ env.RATSPEAK_RSLXMF_REF }}
           path: rsLXMF
 
@@ -79,7 +82,7 @@ jobs:
       - name: Checkout lrgp-rs
         uses: actions/checkout@v5
         with:
-          repository: ${{ github.repository_owner }}/lrgp-rs
+          repository: ${{ env.RATSPEAK_LRGP_REPOSITORY }}
           ref: ${{ env.RATSPEAK_LRGP_REF }}
           path: lrgp-rs
 
