@@ -46,10 +46,10 @@ const VOICE_NOISE_GATE_RELEASE: f32 = 0.06;
 const VOICE_NOISE_GATE_FLOOR_FAST: f32 = 0.06;
 const VOICE_NOISE_GATE_FLOOR_SLOW: f32 = 0.006;
 const VOICE_NOISE_GATE_HOLD_MS: usize = 420;
-const VOICE_PROFILE_UPGRADE_AFTER: Duration = Duration::ZERO;
-const VOICE_PROFILE_SWITCH_COOLDOWN: Duration = Duration::from_secs(12);
+const VOICE_PROFILE_UPGRADE_AFTER: Duration = Duration::from_secs(20);
+const VOICE_PROFILE_UPGRADE_COOLDOWN: Duration = Duration::from_secs(20);
 const VOICE_PROFILE_DOWNGRADE_COOLDOWN: Duration = Duration::from_secs(6);
-const VOICE_PROFILE_UPGRADE_LOCKOUT_AFTER_DOWNGRADE: Duration = Duration::from_secs(60);
+const VOICE_PROFILE_UPGRADE_LOCKOUT_AFTER_DOWNGRADE: Duration = Duration::from_secs(20);
 const VOICE_PROFILE_DROPPED_FRAME_THRESHOLD: usize = 4;
 const VOICE_AUDIO_FADE_IN_MS: usize = 20;
 #[cfg_attr(target_os = "android", allow(dead_code))]
@@ -1576,6 +1576,7 @@ struct VoiceProfileAdaptation {
     requested_profile: Option<Profile>,
     upgrade_blocked_until: Option<Instant>,
     dropped_since_switch: usize,
+    link_graduated: bool,
 }
 
 impl VoiceProfileAdaptation {
@@ -1588,6 +1589,7 @@ impl VoiceProfileAdaptation {
             requested_profile: None,
             upgrade_blocked_until: None,
             dropped_since_switch: 0,
+            link_graduated: false,
         }
     }
 
@@ -1599,6 +1601,7 @@ impl VoiceProfileAdaptation {
         self.requested_profile = None;
         self.upgrade_blocked_until = None;
         self.dropped_since_switch = 0;
+        self.link_graduated = false;
     }
 
     fn reset_for_link(&mut self, link_id: [u8; 16]) {
@@ -1647,7 +1650,7 @@ impl VoiceProfileAdaptation {
 
         if self.dropped_since_switch >= VOICE_PROFILE_DROPPED_FRAME_THRESHOLD
             && self.can_switch(now, VOICE_PROFILE_DOWNGRADE_COOLDOWN)
-            && let Some(profile) = congested_downgrade_profile(current)
+            && let Some(profile) = congested_downgrade_profile(current, self.link_graduated)
         {
             self.upgrade_blocked_until = Some(
                 now.checked_add(VOICE_PROFILE_UPGRADE_LOCKOUT_AFTER_DOWNGRADE)
@@ -1657,7 +1660,6 @@ impl VoiceProfileAdaptation {
         }
 
         if self.dropped_since_switch > 0
-            || !self.can_switch(now, VOICE_PROFILE_SWITCH_COOLDOWN)
             || self
                 .upgrade_blocked_until
                 .is_some_and(|blocked_until| now < blocked_until)
@@ -1670,19 +1672,26 @@ impl VoiceProfileAdaptation {
             .map(|stable_since| now.saturating_duration_since(stable_since))
             .unwrap_or_default();
 
-        match current {
-            Profile::QualityMedium
-                if can_upgrade_voice_profile(current)
-                    && stable_for >= VOICE_PROFILE_UPGRADE_AFTER =>
-            {
-                Some(Profile::QualityHigh)
-            }
-            _ => None,
+        if stable_for >= VOICE_PROFILE_UPGRADE_AFTER
+            && self.can_switch(now, VOICE_PROFILE_UPGRADE_COOLDOWN)
+            && let Some(profile) = stable_upgrade_profile(current)
+        {
+            return Some(profile);
         }
+
+        None
     }
 
     fn mark_switch(&mut self, profile: Profile) {
         let now = Instant::now();
+        if profile == Profile::BandwidthVeryLow {
+            self.link_graduated = false;
+        } else if self
+            .current_profile
+            .is_some_and(|previous| stable_upgrade_profile(previous) == Some(profile))
+        {
+            self.link_graduated = true;
+        }
         self.current_profile = Some(profile);
         self.requested_profile = Some(profile);
         self.stable_since = Some(now);
@@ -1716,6 +1725,11 @@ impl VoiceProfileAdaptation {
             .map(|last_switch_at| now.saturating_duration_since(last_switch_at) >= cooldown)
             .unwrap_or(true)
     }
+
+    #[cfg(test)]
+    fn link_graduated(&self) -> bool {
+        self.link_graduated
+    }
 }
 
 fn is_adaptive_voice_profile(profile: Profile) -> bool {
@@ -1729,10 +1743,6 @@ fn is_adaptive_voice_profile(profile: Profile) -> bool {
     )
 }
 
-fn can_upgrade_voice_profile(profile: Profile) -> bool {
-    matches!(profile, Profile::QualityMedium)
-}
-
 fn lower_bandwidth_profile(profile: Profile) -> Option<Profile> {
     match profile {
         Profile::QualityMax => Some(Profile::QualityHigh),
@@ -1744,7 +1754,11 @@ fn lower_bandwidth_profile(profile: Profile) -> Option<Profile> {
     }
 }
 
-fn congested_downgrade_profile(profile: Profile) -> Option<Profile> {
+fn congested_downgrade_profile(profile: Profile, link_graduated: bool) -> Option<Profile> {
+    if link_graduated {
+        return lower_bandwidth_profile(profile);
+    }
+
     match profile {
         Profile::QualityMax | Profile::QualityHigh | Profile::QualityMedium => {
             Some(Profile::BandwidthVeryLow)
@@ -1755,11 +1769,21 @@ fn congested_downgrade_profile(profile: Profile) -> Option<Profile> {
     }
 }
 
+fn stable_upgrade_profile(profile: Profile) -> Option<Profile> {
+    match profile {
+        Profile::BandwidthVeryLow => Some(Profile::BandwidthLow),
+        Profile::BandwidthLow => Some(Profile::QualityMedium),
+        Profile::QualityMedium => Some(Profile::QualityHigh),
+        Profile::QualityHigh | Profile::QualityMax => None,
+        Profile::BandwidthUltraLow | Profile::LatencyLow | Profile::LatencyUltraLow => None,
+    }
+}
+
 fn profile_adaptation_reason(from: Profile, to: Profile) -> &'static str {
-    if congested_downgrade_profile(from) == Some(to) || lower_bandwidth_profile(from) == Some(to) {
-        "congestion"
-    } else {
+    if stable_upgrade_profile(from) == Some(to) {
         "stable_link"
+    } else {
+        "congestion"
     }
 }
 
@@ -3271,25 +3295,29 @@ mod tests {
     }
 
     #[test]
-    fn profile_adaptation_prefers_high_quality_immediately() {
+    fn profile_adaptation_waits_before_upgrading() {
         let link_id = [0x42; 16];
         let mut adaptation = VoiceProfileAdaptation::new();
 
+        assert_eq!(adaptation.next_profile(link_id, Profile::QualityMedium), None);
+        assert_eq!(adaptation.next_profile(link_id, Profile::BandwidthVeryLow), None);
+    }
+
+    #[test]
+    fn stable_upgrade_profile_steps_up_one_rung_at_a_time() {
         assert_eq!(
-            adaptation.next_profile(link_id, Profile::QualityMedium),
+            stable_upgrade_profile(Profile::BandwidthVeryLow),
+            Some(Profile::BandwidthLow)
+        );
+        assert_eq!(
+            stable_upgrade_profile(Profile::BandwidthLow),
+            Some(Profile::QualityMedium)
+        );
+        assert_eq!(
+            stable_upgrade_profile(Profile::QualityMedium),
             Some(Profile::QualityHigh)
         );
-        adaptation.mark_switch(Profile::QualityHigh);
-        assert!(adaptation.pending_switch(link_id, Profile::QualityMedium));
-
-        assert_eq!(
-            adaptation.next_profile(link_id, Profile::QualityMedium),
-            None
-        );
-        assert!(adaptation.pending_switch(link_id, Profile::QualityMedium));
-
-        assert_eq!(adaptation.next_profile(link_id, Profile::QualityHigh), None);
-        assert!(!adaptation.pending_switch(link_id, Profile::QualityHigh));
+        assert_eq!(stable_upgrade_profile(Profile::QualityHigh), None);
     }
 
     #[test]
@@ -3324,15 +3352,41 @@ mod tests {
     }
 
     #[test]
-    fn congested_downgrade_skips_opus_steps_for_mesh_paths() {
+    fn congested_downgrade_skips_opus_steps_for_unproven_links() {
         assert_eq!(
-            congested_downgrade_profile(Profile::QualityMax),
+            congested_downgrade_profile(Profile::QualityMax, false),
             Some(Profile::BandwidthVeryLow)
         );
         assert_eq!(
-            congested_downgrade_profile(Profile::QualityMedium),
+            congested_downgrade_profile(Profile::QualityMedium, false),
             Some(Profile::BandwidthVeryLow)
         );
+    }
+
+    #[test]
+    fn congested_downgrade_steps_down_one_rung_for_graduated_links() {
+        assert_eq!(
+            congested_downgrade_profile(Profile::QualityHigh, true),
+            Some(Profile::QualityMedium)
+        );
+        assert_eq!(
+            congested_downgrade_profile(Profile::QualityMedium, true),
+            Some(Profile::BandwidthLow)
+        );
+    }
+
+    #[test]
+    fn mark_switch_tracks_graduated_link_after_codec2_climb() {
+        let mut adaptation = VoiceProfileAdaptation::new();
+
+        adaptation.mark_switch(Profile::BandwidthVeryLow);
+        assert!(!adaptation.link_graduated());
+        adaptation.mark_switch(Profile::BandwidthLow);
+        assert!(adaptation.link_graduated());
+        adaptation.mark_switch(Profile::QualityHigh);
+        assert!(adaptation.link_graduated());
+        adaptation.mark_switch(Profile::BandwidthVeryLow);
+        assert!(!adaptation.link_graduated());
     }
 
     #[test]
@@ -3364,7 +3418,7 @@ mod tests {
             "congestion"
         );
         assert_eq!(
-            profile_adaptation_reason(Profile::QualityMedium, Profile::QualityHigh),
+            profile_adaptation_reason(Profile::BandwidthVeryLow, Profile::BandwidthLow),
             "stable_link"
         );
     }
