@@ -12,6 +12,10 @@ on:
           - release
           - debug
 
+env:
+  RATSPEAK_RSLXMF_REPOSITORY: ratspeak/rsLXMF
+  RATSPEAK_LRGP_REPOSITORY: ratspeak/lrgp-rs
+
 jobs:
   build:
     name: ${{ matrix.os }}
@@ -55,13 +59,13 @@ jobs:
       - name: Checkout rsLXMF sibling
         uses: actions/checkout@v5
         with:
-          repository: ${{ github.repository_owner }}/rsLXMF
+          repository: ${{ env.RATSPEAK_RSLXMF_REPOSITORY }}
           path: rsLXMF
 
       - name: Checkout lrgp-rs sibling
         uses: actions/checkout@v5
         with:
-          repository: ${{ github.repository_owner }}/lrgp-rs
+          repository: ${{ env.RATSPEAK_LRGP_REPOSITORY }}
           path: lrgp-rs
 
       - name: Install Rust toolchain

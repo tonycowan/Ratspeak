@@ -1916,7 +1916,10 @@ fn active_call_surface_is_passive_and_shows_elapsed_duration() {
     let lxmf = read_source(root.join("dashboard/static/js/lxmf.js")).expect("lxmf js");
     assert!(lxmf.contains("function _voiceElapsedLabel()"));
     assert!(lxmf.contains("function _voiceGlobalStatusLabel(active)"));
-    assert!(lxmf.contains("return 'Active call' + (elapsed ? ' - ' + elapsed : '');"));
+    assert!(lxmf.contains("var status = 'Active call' + (elapsed ? ' - ' + elapsed : '');"));
+    assert!(lxmf.contains("function _voiceCodecStatusSuffix(call)"));
+    assert!(lxmf.contains("_voiceCodecStatusSuffix(active)"));
+    assert!(lxmf.contains("function _voiceProfileLabel(profileKey)"));
     assert!(lxmf.contains("if (audioIssue) return audioIssue;"));
     assert!(lxmf.contains("Math.max(1"));
     assert!(lxmf.contains("minutes + ':' + (seconds < 10 ? '0' : '') + seconds"));
