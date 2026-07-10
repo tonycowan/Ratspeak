@@ -48,7 +48,7 @@ const VOICE_NOISE_GATE_FLOOR_SLOW: f32 = 0.006;
 const VOICE_NOISE_GATE_HOLD_MS: usize = 420;
 const VOICE_PROFILE_UPGRADE_AFTER: Duration = Duration::ZERO;
 const VOICE_PROFILE_SWITCH_COOLDOWN: Duration = Duration::from_secs(12);
-const VOICE_PROFILE_DOWNGRADE_COOLDOWN: Duration = Duration::from_secs(20);
+const VOICE_PROFILE_DOWNGRADE_COOLDOWN: Duration = Duration::from_secs(6);
 const VOICE_PROFILE_UPGRADE_LOCKOUT_AFTER_DOWNGRADE: Duration = Duration::from_secs(60);
 const VOICE_PROFILE_DROPPED_FRAME_THRESHOLD: usize = 4;
 const VOICE_AUDIO_FADE_IN_MS: usize = 20;
@@ -1178,6 +1178,16 @@ async fn drive_voice_events(
                 frames,
                 dropped,
             } => {
+                profile_adaptation.record_receive(link_id, dropped);
+                if let Some(snapshot) = latest_snapshot.as_ref() {
+                    maybe_adapt_voice_profile(
+                        &state,
+                        &control_tx,
+                        snapshot,
+                        &mut profile_adaptation,
+                    )
+                    .await;
+                }
                 state.emit_to_all(
                     "voice_call_update",
                     json!({
@@ -1427,6 +1437,7 @@ async fn maybe_adapt_voice_profile(
                 "link_id": hex::encode(active.link_id),
                 "from": profile_key(current),
                 "to": profile_key(next),
+                "reason": profile_adaptation_reason(current, next),
             }),
         );
         true
@@ -1616,7 +1627,7 @@ impl VoiceProfileAdaptation {
     }
 
     fn next_profile(&mut self, link_id: [u8; 16], current: Profile) -> Option<Profile> {
-        if !is_adaptive_opus_quality_profile(current) {
+        if !is_adaptive_voice_profile(current) {
             self.reset_for_link(link_id);
             return None;
         }
@@ -1636,7 +1647,7 @@ impl VoiceProfileAdaptation {
 
         if self.dropped_since_switch >= VOICE_PROFILE_DROPPED_FRAME_THRESHOLD
             && self.can_switch(now, VOICE_PROFILE_DOWNGRADE_COOLDOWN)
-            && let Some(profile) = lower_quality_profile(current)
+            && let Some(profile) = congested_downgrade_profile(current)
         {
             self.upgrade_blocked_until = Some(
                 now.checked_add(VOICE_PROFILE_UPGRADE_LOCKOUT_AFTER_DOWNGRADE)
@@ -1660,7 +1671,10 @@ impl VoiceProfileAdaptation {
             .unwrap_or_default();
 
         match current {
-            Profile::QualityMedium if stable_for >= VOICE_PROFILE_UPGRADE_AFTER => {
+            Profile::QualityMedium
+                if can_upgrade_voice_profile(current)
+                    && stable_for >= VOICE_PROFILE_UPGRADE_AFTER =>
+            {
                 Some(Profile::QualityHigh)
             }
             _ => None,
@@ -1704,18 +1718,48 @@ impl VoiceProfileAdaptation {
     }
 }
 
-fn is_adaptive_opus_quality_profile(profile: Profile) -> bool {
+fn is_adaptive_voice_profile(profile: Profile) -> bool {
     matches!(
         profile,
-        Profile::QualityMedium | Profile::QualityHigh | Profile::QualityMax
+        Profile::QualityMax
+            | Profile::QualityHigh
+            | Profile::QualityMedium
+            | Profile::BandwidthLow
+            | Profile::BandwidthVeryLow
     )
 }
 
-fn lower_quality_profile(profile: Profile) -> Option<Profile> {
+fn can_upgrade_voice_profile(profile: Profile) -> bool {
+    matches!(profile, Profile::QualityMedium)
+}
+
+fn lower_bandwidth_profile(profile: Profile) -> Option<Profile> {
     match profile {
         Profile::QualityMax => Some(Profile::QualityHigh),
         Profile::QualityHigh => Some(Profile::QualityMedium),
-        _ => None,
+        Profile::QualityMedium => Some(Profile::BandwidthLow),
+        Profile::BandwidthLow => Some(Profile::BandwidthVeryLow),
+        Profile::BandwidthVeryLow | Profile::BandwidthUltraLow => None,
+        Profile::LatencyLow | Profile::LatencyUltraLow => None,
+    }
+}
+
+fn congested_downgrade_profile(profile: Profile) -> Option<Profile> {
+    match profile {
+        Profile::QualityMax | Profile::QualityHigh | Profile::QualityMedium => {
+            Some(Profile::BandwidthVeryLow)
+        }
+        Profile::BandwidthLow => Some(Profile::BandwidthVeryLow),
+        Profile::BandwidthVeryLow | Profile::BandwidthUltraLow => None,
+        Profile::LatencyLow | Profile::LatencyUltraLow => None,
+    }
+}
+
+fn profile_adaptation_reason(from: Profile, to: Profile) -> &'static str {
+    if congested_downgrade_profile(from) == Some(to) || lower_bandwidth_profile(from) == Some(to) {
+        "congestion"
+    } else {
+        "stable_link"
     }
 }
 
@@ -3246,6 +3290,83 @@ mod tests {
 
         assert_eq!(adaptation.next_profile(link_id, Profile::QualityHigh), None);
         assert!(!adaptation.pending_switch(link_id, Profile::QualityHigh));
+    }
+
+    #[test]
+    fn lower_bandwidth_profile_steps_down_through_codec2() {
+        assert_eq!(
+            lower_bandwidth_profile(Profile::QualityHigh),
+            Some(Profile::QualityMedium)
+        );
+        assert_eq!(
+            lower_bandwidth_profile(Profile::QualityMedium),
+            Some(Profile::BandwidthLow)
+        );
+        assert_eq!(
+            lower_bandwidth_profile(Profile::BandwidthLow),
+            Some(Profile::BandwidthVeryLow)
+        );
+        assert_eq!(lower_bandwidth_profile(Profile::BandwidthVeryLow), None);
+        assert_eq!(lower_bandwidth_profile(Profile::LatencyLow), None);
+    }
+
+    #[test]
+    fn profile_adaptation_downgrades_on_dropped_frames() {
+        let link_id = [0x42; 16];
+        let mut adaptation = VoiceProfileAdaptation::new();
+
+        assert_eq!(adaptation.next_profile(link_id, Profile::QualityHigh), None);
+        adaptation.record_receive(link_id, VOICE_PROFILE_DROPPED_FRAME_THRESHOLD);
+        assert_eq!(
+            adaptation.next_profile(link_id, Profile::QualityHigh),
+            Some(Profile::BandwidthVeryLow)
+        );
+    }
+
+    #[test]
+    fn congested_downgrade_skips_opus_steps_for_mesh_paths() {
+        assert_eq!(
+            congested_downgrade_profile(Profile::QualityMax),
+            Some(Profile::BandwidthVeryLow)
+        );
+        assert_eq!(
+            congested_downgrade_profile(Profile::QualityMedium),
+            Some(Profile::BandwidthVeryLow)
+        );
+    }
+
+    #[test]
+    fn profile_adaptation_downgrades_codec2_when_congested() {
+        let link_id = [0x43; 16];
+        let mut adaptation = VoiceProfileAdaptation::new();
+
+        assert_eq!(adaptation.next_profile(link_id, Profile::BandwidthLow), None);
+        adaptation.record_receive(link_id, VOICE_PROFILE_DROPPED_FRAME_THRESHOLD);
+        assert_eq!(
+            adaptation.next_profile(link_id, Profile::BandwidthLow),
+            Some(Profile::BandwidthVeryLow)
+        );
+    }
+
+    #[test]
+    fn profile_adaptation_ignores_latency_profiles() {
+        let link_id = [0x44; 16];
+        let mut adaptation = VoiceProfileAdaptation::new();
+
+        adaptation.record_receive(link_id, VOICE_PROFILE_DROPPED_FRAME_THRESHOLD);
+        assert_eq!(adaptation.next_profile(link_id, Profile::LatencyLow), None);
+    }
+
+    #[test]
+    fn profile_adaptation_reason_distinguishes_congestion_and_upgrade() {
+        assert_eq!(
+            profile_adaptation_reason(Profile::QualityHigh, Profile::BandwidthVeryLow),
+            "congestion"
+        );
+        assert_eq!(
+            profile_adaptation_reason(Profile::QualityMedium, Profile::QualityHigh),
+            "stable_link"
+        );
     }
 
     #[test]
