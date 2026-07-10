@@ -51,6 +51,8 @@ const VOICE_PROFILE_UPGRADE_COOLDOWN: Duration = Duration::from_secs(20);
 const VOICE_PROFILE_DOWNGRADE_COOLDOWN: Duration = Duration::from_secs(6);
 const VOICE_PROFILE_UPGRADE_LOCKOUT_AFTER_DOWNGRADE: Duration = Duration::from_secs(20);
 const VOICE_PROFILE_DROPPED_FRAME_THRESHOLD: usize = 4;
+const VOICE_PROFILE_RECEIVE_STALL_AFTER: Duration = Duration::from_secs(3);
+const VOICE_PROFILE_TRANSPORT_PRESSURE_THRESHOLD: usize = 1;
 const VOICE_AUDIO_FADE_IN_MS: usize = 20;
 #[cfg_attr(target_os = "android", allow(dead_code))]
 const VOICE_AUDIO_OUTPUT_PREBUFFER_MS: usize = 120;
@@ -890,6 +892,13 @@ async fn drive_voice_events(
             }
             _ = audio_recovery_tick.tick() => {
                 if let Some(snapshot) = latest_snapshot.as_ref() {
+                    maybe_adapt_voice_profile(
+                        &state,
+                        &control_tx,
+                        snapshot,
+                        &mut profile_adaptation,
+                    )
+                    .await;
                     reconcile_audio_session(
                         &state,
                         &control_tx,
@@ -1119,6 +1128,9 @@ async fn drive_voice_events(
                 frames,
                 dropped,
             } => {
+                if frames > 0 {
+                    profile_adaptation.record_inbound_media(link_id);
+                }
                 profile_adaptation.record_receive(link_id, dropped);
                 if let Some(snapshot) = latest_snapshot.as_ref() {
                     maybe_adapt_voice_profile(
@@ -1178,6 +1190,9 @@ async fn drive_voice_events(
                 frames,
                 dropped,
             } => {
+                if frames > 0 {
+                    profile_adaptation.record_inbound_media(link_id);
+                }
                 profile_adaptation.record_receive(link_id, dropped);
                 if let Some(snapshot) = latest_snapshot.as_ref() {
                     maybe_adapt_voice_profile(
@@ -1200,6 +1215,22 @@ async fn drive_voice_events(
                 );
             }
             TelephonyServiceEvent::Error { message } => {
+                if message.contains("Reticulum transport queue is full")
+                    && let Some(active) = latest_snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.active_call.as_ref())
+                {
+                    profile_adaptation.record_transport_pressure(active.link_id);
+                    if let Some(snapshot) = latest_snapshot.as_ref() {
+                        maybe_adapt_voice_profile(
+                            &state,
+                            &control_tx,
+                            snapshot,
+                            &mut profile_adaptation,
+                        )
+                        .await;
+                    }
+                }
                 state.emit_to_all(
                     "voice_call_update",
                     json!({
@@ -1208,6 +1239,18 @@ async fn drive_voice_events(
                     }),
                 );
                 emit_lxst_activity(&state, "LXST voice error", &message, "standard");
+            }
+            TelephonyServiceEvent::MediaReceived { link_id, .. } => {
+                profile_adaptation.record_inbound_media(link_id);
+                if let Some(snapshot) = latest_snapshot.as_ref() {
+                    maybe_adapt_voice_profile(
+                        &state,
+                        &control_tx,
+                        snapshot,
+                        &mut profile_adaptation,
+                    )
+                    .await;
+                }
             }
             TelephonyServiceEvent::MediaSent { .. } => {
                 if let Some(snapshot) = latest_snapshot.as_ref() {
@@ -1233,8 +1276,7 @@ async fn drive_voice_events(
                 );
                 break;
             }
-            TelephonyServiceEvent::MediaReceived { .. }
-            | TelephonyServiceEvent::OpusFramesReceived { .. }
+            TelephonyServiceEvent::OpusFramesReceived { .. }
             | TelephonyServiceEvent::Codec2FramesReceived { .. }
             | TelephonyServiceEvent::Drive(_) => {}
         }
@@ -1414,7 +1456,7 @@ async fn maybe_adapt_voice_profile(
     }
 
     let current = active.profile.unwrap_or(Profile::DEFAULT);
-    let Some(next) = adaptation.next_profile(active.link_id, current) else {
+    let Some((next, reason)) = adaptation.next_profile(active.link_id, current) else {
         return false;
     };
 
@@ -1427,6 +1469,7 @@ async fn maybe_adapt_voice_profile(
             link_id = %hex::encode(active.link_id),
             from = profile_key(current),
             to = profile_key(next),
+            reason,
             "switching LXST voice profile"
         );
         adaptation.mark_switch(next);
@@ -1437,7 +1480,7 @@ async fn maybe_adapt_voice_profile(
                 "link_id": hex::encode(active.link_id),
                 "from": profile_key(current),
                 "to": profile_key(next),
-                "reason": profile_adaptation_reason(current, next),
+                "reason": reason,
             }),
         );
         true
@@ -1576,6 +1619,8 @@ struct VoiceProfileAdaptation {
     requested_profile: Option<Profile>,
     upgrade_blocked_until: Option<Instant>,
     dropped_since_switch: usize,
+    transport_pressure: usize,
+    last_inbound_media_at: Option<Instant>,
     link_graduated: bool,
 }
 
@@ -1589,6 +1634,8 @@ impl VoiceProfileAdaptation {
             requested_profile: None,
             upgrade_blocked_until: None,
             dropped_since_switch: 0,
+            transport_pressure: 0,
+            last_inbound_media_at: None,
             link_graduated: false,
         }
     }
@@ -1601,6 +1648,8 @@ impl VoiceProfileAdaptation {
         self.requested_profile = None;
         self.upgrade_blocked_until = None;
         self.dropped_since_switch = 0;
+        self.transport_pressure = 0;
+        self.last_inbound_media_at = None;
         self.link_graduated = false;
     }
 
@@ -1611,6 +1660,7 @@ impl VoiceProfileAdaptation {
             self.requested_profile = None;
             self.upgrade_blocked_until = None;
             self.dropped_since_switch = 0;
+            self.transport_pressure = 0;
         } else {
             self.reset();
         }
@@ -1622,6 +1672,18 @@ impl VoiceProfileAdaptation {
         }
     }
 
+    fn record_inbound_media(&mut self, link_id: [u8; 16]) {
+        if self.link_id == Some(link_id) {
+            self.last_inbound_media_at = Some(Instant::now());
+        }
+    }
+
+    fn record_transport_pressure(&mut self, link_id: [u8; 16]) {
+        if self.link_id == Some(link_id) {
+            self.transport_pressure = self.transport_pressure.saturating_add(1);
+        }
+    }
+
     fn pending_switch(&self, link_id: [u8; 16], current: Profile) -> bool {
         self.link_id == Some(link_id)
             && self
@@ -1629,7 +1691,7 @@ impl VoiceProfileAdaptation {
                 .is_some_and(|requested| requested != current)
     }
 
-    fn next_profile(&mut self, link_id: [u8; 16], current: Profile) -> Option<Profile> {
+    fn next_profile(&mut self, link_id: [u8; 16], current: Profile) -> Option<(Profile, &'static str)> {
         if !is_adaptive_voice_profile(current) {
             self.reset_for_link(link_id);
             return None;
@@ -1648,18 +1710,19 @@ impl VoiceProfileAdaptation {
 
         self.sync(link_id, current, now);
 
-        if self.dropped_since_switch >= VOICE_PROFILE_DROPPED_FRAME_THRESHOLD
-            && self.can_switch(now, VOICE_PROFILE_DOWNGRADE_COOLDOWN)
+        if let Some(reason) = self.congestion_trigger(now)
+            && self.can_switch(now, self.downgrade_cooldown(now, reason))
             && let Some(profile) = congested_downgrade_profile(current, self.link_graduated)
         {
             self.upgrade_blocked_until = Some(
                 now.checked_add(VOICE_PROFILE_UPGRADE_LOCKOUT_AFTER_DOWNGRADE)
                     .unwrap_or(now),
             );
-            return Some(profile);
+            return Some((profile, reason));
         }
 
         if self.dropped_since_switch > 0
+            || self.transport_pressure > 0
             || self
                 .upgrade_blocked_until
                 .is_some_and(|blocked_until| now < blocked_until)
@@ -1676,10 +1739,31 @@ impl VoiceProfileAdaptation {
             && self.can_switch(now, VOICE_PROFILE_UPGRADE_COOLDOWN)
             && let Some(profile) = stable_upgrade_profile(current)
         {
-            return Some(profile);
+            return Some((profile, "stable_link"));
         }
 
         None
+    }
+
+    fn congestion_trigger(&self, now: Instant) -> Option<&'static str> {
+        if self.dropped_since_switch >= VOICE_PROFILE_DROPPED_FRAME_THRESHOLD {
+            return Some("dropped_frames");
+        }
+        if self.transport_pressure >= VOICE_PROFILE_TRANSPORT_PRESSURE_THRESHOLD {
+            return Some("transport_pressure");
+        }
+        if receive_stalled_at(self.last_inbound_media_at, now) {
+            return Some("receive_stall");
+        }
+        None
+    }
+
+    fn downgrade_cooldown(&self, _now: Instant, reason: &str) -> Duration {
+        if reason == "receive_stall" {
+            Duration::ZERO
+        } else {
+            VOICE_PROFILE_DOWNGRADE_COOLDOWN
+        }
     }
 
     fn mark_switch(&mut self, profile: Profile) {
@@ -1697,6 +1781,8 @@ impl VoiceProfileAdaptation {
         self.stable_since = Some(now);
         self.last_switch_at = Some(now);
         self.dropped_since_switch = 0;
+        self.transport_pressure = 0;
+        self.last_inbound_media_at = Some(now);
     }
 
     fn sync(&mut self, link_id: [u8; 16], profile: Profile, now: Instant) {
@@ -1707,6 +1793,8 @@ impl VoiceProfileAdaptation {
             self.requested_profile = None;
             self.upgrade_blocked_until = None;
             self.dropped_since_switch = 0;
+            self.transport_pressure = 0;
+            self.last_inbound_media_at = Some(now);
             return;
         }
 
@@ -1715,8 +1803,13 @@ impl VoiceProfileAdaptation {
             self.requested_profile = None;
             self.stable_since = Some(now);
             self.dropped_since_switch = 0;
+            self.transport_pressure = 0;
+            self.last_inbound_media_at = Some(now);
         } else if self.stable_since.is_none() {
             self.stable_since = Some(now);
+            if self.last_inbound_media_at.is_none() {
+                self.last_inbound_media_at = Some(now);
+            }
         }
     }
 
@@ -1724,6 +1817,12 @@ impl VoiceProfileAdaptation {
         self.last_switch_at
             .map(|last_switch_at| now.saturating_duration_since(last_switch_at) >= cooldown)
             .unwrap_or(true)
+    }
+
+    #[cfg(test)]
+    fn seed_inbound_media_clock(&mut self, link_id: [u8; 16], profile: Profile, media_at: Instant) {
+        self.sync(link_id, profile, media_at);
+        self.last_inbound_media_at = Some(media_at);
     }
 
     #[cfg(test)]
@@ -1769,6 +1868,11 @@ fn congested_downgrade_profile(profile: Profile, link_graduated: bool) -> Option
     }
 }
 
+fn receive_stalled_at(last_inbound_media_at: Option<Instant>, now: Instant) -> bool {
+    last_inbound_media_at
+        .is_some_and(|at| now.saturating_duration_since(at) >= VOICE_PROFILE_RECEIVE_STALL_AFTER)
+}
+
 fn stable_upgrade_profile(profile: Profile) -> Option<Profile> {
     match profile {
         Profile::BandwidthVeryLow => Some(Profile::BandwidthLow),
@@ -1776,14 +1880,6 @@ fn stable_upgrade_profile(profile: Profile) -> Option<Profile> {
         Profile::QualityMedium => Some(Profile::QualityHigh),
         Profile::QualityHigh | Profile::QualityMax => None,
         Profile::BandwidthUltraLow | Profile::LatencyLow | Profile::LatencyUltraLow => None,
-    }
-}
-
-fn profile_adaptation_reason(from: Profile, to: Profile) -> &'static str {
-    if stable_upgrade_profile(from) == Some(to) {
-        "stable_link"
-    } else {
-        "congestion"
     }
 }
 
@@ -3347,7 +3443,47 @@ mod tests {
         adaptation.record_receive(link_id, VOICE_PROFILE_DROPPED_FRAME_THRESHOLD);
         assert_eq!(
             adaptation.next_profile(link_id, Profile::QualityHigh),
-            Some(Profile::BandwidthVeryLow)
+            Some((Profile::BandwidthVeryLow, "dropped_frames"))
+        );
+    }
+
+    #[test]
+    fn profile_adaptation_downgrades_on_transport_pressure() {
+        let link_id = [0x46; 16];
+        let mut adaptation = VoiceProfileAdaptation::new();
+
+        assert_eq!(adaptation.next_profile(link_id, Profile::QualityHigh), None);
+        adaptation.record_transport_pressure(link_id);
+        assert_eq!(
+            adaptation.next_profile(link_id, Profile::QualityHigh),
+            Some((Profile::BandwidthVeryLow, "transport_pressure"))
+        );
+    }
+
+    #[test]
+    fn receive_stalled_at_detects_missing_inbound_media() {
+        let now = Instant::now();
+        let recent = now - Duration::from_secs(1);
+        let stale = now - VOICE_PROFILE_RECEIVE_STALL_AFTER - Duration::from_millis(1);
+
+        assert!(!receive_stalled_at(None, now));
+        assert!(!receive_stalled_at(Some(recent), now));
+        assert!(receive_stalled_at(Some(stale), now));
+    }
+
+    #[test]
+    fn profile_adaptation_downgrades_on_receive_stall() {
+        let link_id = [0x47; 16];
+        let mut adaptation = VoiceProfileAdaptation::new();
+        let stale = Instant::now()
+            - VOICE_PROFILE_RECEIVE_STALL_AFTER
+            - Duration::from_millis(1);
+
+        assert_eq!(adaptation.next_profile(link_id, Profile::QualityHigh), None);
+        adaptation.seed_inbound_media_clock(link_id, Profile::QualityHigh, stale);
+        assert_eq!(
+            adaptation.next_profile(link_id, Profile::QualityHigh),
+            Some((Profile::BandwidthVeryLow, "receive_stall"))
         );
     }
 
@@ -3398,7 +3534,7 @@ mod tests {
         adaptation.record_receive(link_id, VOICE_PROFILE_DROPPED_FRAME_THRESHOLD);
         assert_eq!(
             adaptation.next_profile(link_id, Profile::BandwidthLow),
-            Some(Profile::BandwidthVeryLow)
+            Some((Profile::BandwidthVeryLow, "dropped_frames"))
         );
     }
 
@@ -3409,18 +3545,6 @@ mod tests {
 
         adaptation.record_receive(link_id, VOICE_PROFILE_DROPPED_FRAME_THRESHOLD);
         assert_eq!(adaptation.next_profile(link_id, Profile::LatencyLow), None);
-    }
-
-    #[test]
-    fn profile_adaptation_reason_distinguishes_congestion_and_upgrade() {
-        assert_eq!(
-            profile_adaptation_reason(Profile::QualityHigh, Profile::BandwidthVeryLow),
-            "congestion"
-        );
-        assert_eq!(
-            profile_adaptation_reason(Profile::BandwidthVeryLow, Profile::BandwidthLow),
-            "stable_link"
-        );
     }
 
     #[test]
