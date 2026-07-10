@@ -4323,7 +4323,7 @@ dependencies = [
 
 [[package]]
 name = "ratspeak"
-version = "1.0.25"
+version = "1.0.26"
 dependencies = [
  "base64 0.22.1",
  "block2 0.6.2",
@@ -4353,7 +4353,7 @@ dependencies = [
 
 [[package]]
 name = "ratspeak-core"
-version = "1.0.25"
+version = "1.0.26"
 dependencies = [
  "serde",
  "serde_json",
@@ -4363,7 +4363,7 @@ dependencies = [
 
 [[package]]
 name = "ratspeak-db"
-version = "1.0.25"
+version = "1.0.26"
 dependencies = [
  "hex",
  "lrgp",
@@ -4380,7 +4380,7 @@ dependencies = [
 
 [[package]]
 name = "ratspeak-runtime"
-version = "1.0.25"
+version = "1.0.26"
 dependencies = [
  "argon2",
  "bytes",
@@ -4421,7 +4421,7 @@ dependencies = [
 
 [[package]]
 name = "ratspeak-tauri"
-version = "1.0.25"
+version = "1.0.26"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4481,7 +4481,7 @@ dependencies = [
 
 [[package]]
 name = "ref-cast"
-version = "1.0.25"
+version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f354300ae66f76f1c85c5f84693f0ce81d747e2c3f21a45fef496d89c960bf7d"
 dependencies = [
@@ -4490,7 +4490,7 @@ dependencies = [
 
 [[package]]
 name = "ref-cast-impl"
-version = "1.0.25"
+version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7186006dcb21920990093f30e3dea63b7d6e977bf1256be20c3563a5db070da"
 dependencies = [
