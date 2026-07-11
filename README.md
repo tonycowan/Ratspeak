@@ -53,7 +53,7 @@ released. iOS does not have a public download yet; and macOS is unsigned, with W
 - Contacts, discovered peers, path requests, interface status, propagation
   status, and transport health in the app.
 - Experimental peer-to-peer voice calls over [LXST](https://github.com/ratspeak/rsLXST)
-  (contacts-only, 0-hop, native microphone/speaker).
+  (contacts-only, 0-hop, native microphone/speaker, adaptive Codec2→Opus quality).
 - Chess and Tic-Tac-Toe.
 - I'm tired boss, this whole README is going to get a revamp.
 
@@ -114,8 +114,45 @@ links — no servers, no relays. The stack is new and intentionally narrow:
   `cargo tauri dev --no-default-features` if you want to build Ratspeak
   without the voice stack.
 
-Voice is experimental — expect rough edges. Codec quality, call setup,
-ringtones, and platform audio routing are all subject to change.
+### Adaptive quality
+
+Calls start at **Codec2 1600** so narrowband mesh paths work from the first
+frame. When the link stays healthy, Ratspeak climbs quality in steps — both
+sides must agree before each step:
+
+```text
+Codec2 1600 → Codec2 3200 → Opus MQ → Opus HQ
+```
+
+Automatic climbing stops at Opus HQ (mono, ~16 kbps). Opus Max is not part of
+the adaptive ladder; use `RATSPEAK_VOICE_PROFILE` only if you want to pin or
+override the profile manually.
+
+| | |
+| --- | --- |
+| **Upgrades** | Consensus-based. After ~3 s stable at the current tier, the side holding the upgrade token proposes the next step; the peer accepts when its path looks healthy. |
+| **Downgrades** | Immediate when either side sees sustained congestion — dropped frames, transport back-pressure, or playback underruns after a short grace period following a switch. |
+| **WiFi** | Typically reaches Opus HQ within ~15 s with intelligible audio throughout. |
+| **LoRa** | May try higher tiers but often settles at Codec2 1600 when Opus cannot keep up; brief glitches during climb attempts are expected on very slow paths. |
+
+There is no separate WiFi vs LoRa policy — the same negotiation runs on every
+interface and adapts to what the path can carry.
+
+### Diagnostics
+
+On desktop, enable voice negotiation logging:
+
+```bash
+RATSPEAK_DIAGNOSTICS=1 RATSPEAK_DIAGNOSTIC_FILE=1 RUST_LOG=info cargo tauri dev
+```
+
+Log file (macOS): `~/Library/Application Support/Ratspeak/logs/ratspeak.log`
+
+Look for `proposing LXST voice profile upgrade`, `accepting`, and `switching
+LXST voice profile` lines to trace the climb ladder.
+
+Voice is experimental — expect rough edges. Ringtones and platform audio
+routing are still subject to change.
 
 ## Platform Notes
 
