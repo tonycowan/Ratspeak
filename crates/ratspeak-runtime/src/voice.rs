@@ -50,6 +50,7 @@ const VOICE_PROFILE_UPGRADE_AFTER: Duration = Duration::from_secs(2);
 const VOICE_PROFILE_UPGRADE_COOLDOWN: Duration = Duration::from_secs(2);
 const VOICE_PROFILE_UPGRADE_PROPOSAL_TIMEOUT: Duration = Duration::from_secs(10);
 const VOICE_PROFILE_DOWNGRADE_COOLDOWN: Duration = Duration::from_secs(6);
+const VOICE_PROFILE_TRANSPORT_PRESSURE_DECAY: Duration = Duration::from_secs(20);
 const VOICE_PROFILE_DROPPED_FRAME_THRESHOLD: usize = 4;
 const VOICE_PROFILE_PLAYBACK_UNDERRUN_THRESHOLD_SAMPLES: u64 = 2_400;
 const VOICE_PROFILE_TRANSPORT_PRESSURE_THRESHOLD: usize = 1;
@@ -79,6 +80,10 @@ fn voice_output_gain(profile: Profile) -> f32 {
 
 fn voice_initial_profile() -> Profile {
     voice_profile_from_env().unwrap_or(VOICE_INITIAL_PROFILE)
+}
+
+fn snapshot_voice_profile(profile: Option<Profile>) -> Profile {
+    profile.unwrap_or(VOICE_INITIAL_PROFILE)
 }
 
 fn voice_profile_source() -> &'static str {
@@ -1273,8 +1278,8 @@ async fn drive_voice_events(
                     let current = snapshot
                         .active_call
                         .as_ref()
-                        .and_then(|active| active.profile)
-                        .unwrap_or(Profile::DEFAULT);
+                        .map(|active| snapshot_voice_profile(active.profile))
+                        .unwrap_or(VOICE_INITIAL_PROFILE);
                     profile_negotiation.record_remote_proposal(link_id, current, profile);
                     maybe_adapt_voice_profile(
                         &state,
@@ -1409,7 +1414,7 @@ async fn reconcile_audio_session(
         return;
     }
 
-    let profile = active.profile.unwrap_or(Profile::DEFAULT);
+    let profile = snapshot_voice_profile(active.profile);
 
     let current_matches = audio_session
         .as_ref()
@@ -1494,7 +1499,7 @@ async fn maybe_adapt_voice_profile(
         return false;
     }
 
-    let current = active.profile.unwrap_or(Profile::DEFAULT);
+    let current = snapshot_voice_profile(active.profile);
     let Some(action) = negotiation.next_action(active.link_id, active.role, current) else {
         return false;
     };
@@ -1594,7 +1599,7 @@ fn profile_switch_pending(
     snapshot: &TelephonyRuntimeSnapshot,
 ) -> bool {
     snapshot.active_call.as_ref().is_some_and(|active| {
-        let current = active.profile.unwrap_or(Profile::DEFAULT);
+        let current = snapshot_voice_profile(active.profile);
         active.status == SignallingStatus::Established
             && negotiation.pending_switch(active.link_id, current)
     })
@@ -1741,6 +1746,7 @@ struct VoiceProfileNegotiation {
     remote_proposal: Option<Profile>,
     dropped_since_switch: usize,
     transport_pressure: usize,
+    last_transport_pressure_at: Option<Instant>,
     playback_underrun_samples_since_switch: u64,
     link_graduated: bool,
 }
@@ -1758,6 +1764,7 @@ impl VoiceProfileNegotiation {
             remote_proposal: None,
             dropped_since_switch: 0,
             transport_pressure: 0,
+            last_transport_pressure_at: None,
             playback_underrun_samples_since_switch: 0,
             link_graduated: false,
         }
@@ -1774,6 +1781,7 @@ impl VoiceProfileNegotiation {
         self.remote_proposal = None;
         self.dropped_since_switch = 0;
         self.transport_pressure = 0;
+        self.last_transport_pressure_at = None;
         self.playback_underrun_samples_since_switch = 0;
         self.link_graduated = false;
     }
@@ -1787,8 +1795,26 @@ impl VoiceProfileNegotiation {
             self.remote_proposal = None;
             self.dropped_since_switch = 0;
             self.transport_pressure = 0;
+            self.last_transport_pressure_at = None;
         } else {
             self.reset();
+        }
+    }
+
+    fn ensure_link(&mut self, link_id: [u8; 16]) {
+        if self.link_id.is_none() {
+            self.link_id = Some(link_id);
+        }
+    }
+
+    fn decay_transport_pressure(&mut self, now: Instant) {
+        if self.transport_pressure > 0
+            && self
+                .last_transport_pressure_at
+                .is_some_and(|at| now.saturating_duration_since(at) >= VOICE_PROFILE_TRANSPORT_PRESSURE_DECAY)
+        {
+            self.transport_pressure = 0;
+            self.last_transport_pressure_at = None;
         }
     }
 
@@ -1797,12 +1823,14 @@ impl VoiceProfileNegotiation {
     }
 
     fn record_receive(&mut self, link_id: [u8; 16], dropped: usize) {
-        if self.link_id == Some(link_id) {
+        self.ensure_link(link_id);
+        if self.link_id == Some(link_id) && dropped > 0 {
             self.dropped_since_switch = self.dropped_since_switch.saturating_add(dropped);
         }
     }
 
     fn record_playback_underruns(&mut self, link_id: [u8; 16], samples: u64) {
+        self.ensure_link(link_id);
         if self.link_id == Some(link_id) && samples > 0 {
             self.playback_underrun_samples_since_switch = self
                 .playback_underrun_samples_since_switch
@@ -1811,18 +1839,26 @@ impl VoiceProfileNegotiation {
     }
 
     fn record_transport_pressure(&mut self, link_id: [u8; 16]) {
+        self.ensure_link(link_id);
         if self.link_id == Some(link_id) {
             self.transport_pressure = self.transport_pressure.saturating_add(1);
+            self.last_transport_pressure_at = Some(Instant::now());
         }
     }
 
     fn record_remote_proposal(&mut self, link_id: [u8; 16], current: Profile, profile: Profile) {
-        if self.link_id == Some(link_id) && stable_upgrade_profile(current) == Some(profile) {
+        self.ensure_link(link_id);
+        if self.link_id != Some(link_id) {
+            return;
+        }
+        let effective_current = self.current_profile.unwrap_or(current);
+        if stable_upgrade_profile(effective_current) == Some(profile) {
             self.remote_proposal = Some(profile);
         }
     }
 
     fn record_remote_accept(&mut self, link_id: [u8; 16], profile: Profile) {
+        self.ensure_link(link_id);
         if self.link_id == Some(link_id) && self.pending_proposal == Some(profile) {
             self.pending_proposal = None;
         }
@@ -1858,6 +1894,7 @@ impl VoiceProfileNegotiation {
         }
 
         self.sync(link_id, role, current, now);
+        self.decay_transport_pressure(now);
 
         if self.pending_proposal.is_some()
             && self.last_switch_at.is_some_and(|sent| {
@@ -1867,7 +1904,7 @@ impl VoiceProfileNegotiation {
             self.pending_proposal = None;
         }
 
-        if let Some(reason) = self.congestion_trigger() {
+        if let Some(reason) = self.downgrade_congestion_trigger() {
             if self.can_switch(now, self.downgrade_cooldown(reason))
                 && let Some(profile) = congested_downgrade_profile(current, self.link_graduated)
             {
@@ -1875,6 +1912,12 @@ impl VoiceProfileNegotiation {
                 self.remote_proposal = None;
                 return Some(VoiceProfileAction::SwitchProfile { profile, reason });
             }
+            if self.path_congestion_trigger().is_some() {
+                return None;
+            }
+        }
+
+        if self.path_congestion_trigger().is_some() {
             return None;
         }
 
@@ -1904,12 +1947,19 @@ impl VoiceProfileNegotiation {
         None
     }
 
-    fn congestion_trigger(&self) -> Option<&'static str> {
+    fn path_congestion_trigger(&self) -> Option<&'static str> {
         if self.dropped_since_switch >= VOICE_PROFILE_DROPPED_FRAME_THRESHOLD {
             return Some("dropped_frames");
         }
         if self.transport_pressure >= VOICE_PROFILE_TRANSPORT_PRESSURE_THRESHOLD {
             return Some("transport_pressure");
+        }
+        None
+    }
+
+    fn downgrade_congestion_trigger(&self) -> Option<&'static str> {
+        if let Some(reason) = self.path_congestion_trigger() {
+            return Some(reason);
         }
         if self.playback_underrun_samples_since_switch
             >= VOICE_PROFILE_PLAYBACK_UNDERRUN_THRESHOLD_SAMPLES
@@ -1957,6 +2007,7 @@ impl VoiceProfileNegotiation {
         self.last_switch_at = Some(now);
         self.dropped_since_switch = 0;
         self.transport_pressure = 0;
+        self.last_transport_pressure_at = None;
         self.playback_underrun_samples_since_switch = 0;
     }
 
@@ -1976,6 +2027,7 @@ impl VoiceProfileNegotiation {
             self.remote_proposal = None;
             self.dropped_since_switch = 0;
             self.transport_pressure = 0;
+            self.last_transport_pressure_at = None;
             self.playback_underrun_samples_since_switch = 0;
             return;
         }
@@ -2002,6 +2054,7 @@ impl VoiceProfileNegotiation {
             self.stable_since = Some(now);
             self.dropped_since_switch = 0;
             self.transport_pressure = 0;
+            self.last_transport_pressure_at = None;
             self.playback_underrun_samples_since_switch = 0;
         } else if self.stable_since.is_none() {
             self.stable_since = Some(now);
@@ -3805,7 +3858,7 @@ mod tests {
     }
 
     #[test]
-    fn acceptor_rejects_proposal_when_playback_underruns() {
+    fn acceptor_rejects_proposal_when_path_is_congested() {
         let link_id = [0x4d; 16];
         let mut negotiation = VoiceProfileNegotiation::new();
         negotiation.sync(
@@ -3820,7 +3873,7 @@ mod tests {
             Profile::BandwidthVeryLow,
             Profile::BandwidthLow,
         );
-        negotiation.record_playback_underruns(link_id, playback_underrun_threshold_samples());
+        negotiation.record_receive(link_id, VOICE_PROFILE_DROPPED_FRAME_THRESHOLD);
         assert_eq!(
             next_accept_profile(
                 &mut negotiation,
@@ -4036,7 +4089,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_negotiation_blocks_upgrade_after_playback_underrun() {
+    fn playback_underruns_do_not_block_upgrade_proposal() {
         let link_id = [0x47; 16];
         let mut negotiation = VoiceProfileNegotiation::new();
         let stable_since = Instant::now()
@@ -4057,7 +4110,27 @@ mod tests {
                 CallRole::Incoming,
                 Profile::BandwidthVeryLow,
             ),
-            None
+            Some(Profile::BandwidthLow)
+        );
+    }
+
+    #[test]
+    fn remote_proposal_is_recorded_before_negotiation_sync() {
+        let link_id = [0x4f; 16];
+        let mut negotiation = VoiceProfileNegotiation::new();
+        negotiation.record_remote_proposal(
+            link_id,
+            Profile::BandwidthVeryLow,
+            Profile::BandwidthLow,
+        );
+        assert_eq!(
+            next_accept_profile(
+                &mut negotiation,
+                link_id,
+                CallRole::Outgoing,
+                Profile::BandwidthVeryLow,
+            ),
+            Some(Profile::BandwidthLow)
         );
     }
 
