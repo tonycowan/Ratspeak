@@ -53,6 +53,7 @@ const VOICE_PROFILE_DOWNGRADE_COOLDOWN: Duration = Duration::from_secs(6);
 const VOICE_PROFILE_TRANSPORT_PRESSURE_DECAY: Duration = Duration::from_secs(20);
 const VOICE_PROFILE_DROPPED_FRAME_THRESHOLD: usize = 4;
 const VOICE_PROFILE_PLAYBACK_UNDERRUN_THRESHOLD_SAMPLES: u64 = 2_400;
+const VOICE_PROFILE_PLAYBACK_UNDERRUN_GRACE_AFTER_SWITCH: Duration = Duration::from_secs(2);
 const VOICE_PROFILE_TRANSPORT_PRESSURE_THRESHOLD: usize = 1;
 const VOICE_AUDIO_FADE_IN_MS: usize = 20;
 #[cfg_attr(target_os = "android", allow(dead_code))]
@@ -1831,11 +1832,15 @@ impl VoiceProfileNegotiation {
 
     fn record_playback_underruns(&mut self, link_id: [u8; 16], samples: u64) {
         self.ensure_link(link_id);
-        if self.link_id == Some(link_id) && samples > 0 {
-            self.playback_underrun_samples_since_switch = self
-                .playback_underrun_samples_since_switch
-                .saturating_add(samples);
+        if self.link_id != Some(link_id) || samples == 0 {
+            return;
         }
+        if !self.playback_underrun_downgrade_eligible(Instant::now()) {
+            return;
+        }
+        self.playback_underrun_samples_since_switch = self
+            .playback_underrun_samples_since_switch
+            .saturating_add(samples);
     }
 
     fn record_transport_pressure(&mut self, link_id: [u8; 16]) {
@@ -1904,7 +1909,7 @@ impl VoiceProfileNegotiation {
             self.pending_proposal = None;
         }
 
-        if let Some(reason) = self.downgrade_congestion_trigger() {
+        if let Some(reason) = self.downgrade_congestion_trigger(now) {
             if self.can_switch(now, self.downgrade_cooldown(reason))
                 && let Some(profile) = congested_downgrade_profile(current, self.link_graduated)
             {
@@ -1957,12 +1962,20 @@ impl VoiceProfileNegotiation {
         None
     }
 
-    fn downgrade_congestion_trigger(&self) -> Option<&'static str> {
+    fn playback_underrun_downgrade_eligible(&self, now: Instant) -> bool {
+        self.stable_since.is_some_and(|stable_since| {
+            now.saturating_duration_since(stable_since)
+                >= VOICE_PROFILE_PLAYBACK_UNDERRUN_GRACE_AFTER_SWITCH
+        })
+    }
+
+    fn downgrade_congestion_trigger(&self, now: Instant) -> Option<&'static str> {
         if let Some(reason) = self.path_congestion_trigger() {
             return Some(reason);
         }
         if self.playback_underrun_samples_since_switch
             >= VOICE_PROFILE_PLAYBACK_UNDERRUN_THRESHOLD_SAMPLES
+            && self.playback_underrun_downgrade_eligible(now)
         {
             return Some("playback_underrun");
         }
@@ -4164,15 +4177,15 @@ mod tests {
     fn profile_negotiation_downgrades_on_playback_underrun() {
         let link_id = [0x47; 16];
         let mut negotiation = VoiceProfileNegotiation::new();
+        let stable_since = Instant::now()
+            - VOICE_PROFILE_PLAYBACK_UNDERRUN_GRACE_AFTER_SWITCH
+            - Duration::from_millis(1);
 
-        assert_eq!(
-            next_switch_profile(
-                &mut negotiation,
-                link_id,
-                CallRole::Outgoing,
-                Profile::QualityHigh,
-            ),
-            None
+        negotiation.seed_stable_clock(
+            link_id,
+            CallRole::Outgoing,
+            Profile::QualityHigh,
+            stable_since,
         );
         negotiation.record_playback_underruns(
             link_id,
@@ -4186,6 +4199,32 @@ mod tests {
                 Profile::QualityHigh,
             ),
             Some((Profile::BandwidthVeryLow, "playback_underrun"))
+        );
+    }
+
+    #[test]
+    fn profile_negotiation_ignores_playback_underrun_during_switch_grace() {
+        let link_id = [0x50; 16];
+        let mut negotiation = VoiceProfileNegotiation::new();
+
+        negotiation.sync(
+            link_id,
+            CallRole::Incoming,
+            Profile::BandwidthLow,
+            Instant::now(),
+        );
+        negotiation.record_playback_underruns(
+            link_id,
+            playback_underrun_threshold_samples(),
+        );
+        assert_eq!(
+            next_switch_profile(
+                &mut negotiation,
+                link_id,
+                CallRole::Incoming,
+                Profile::BandwidthLow,
+            ),
+            None
         );
     }
 
