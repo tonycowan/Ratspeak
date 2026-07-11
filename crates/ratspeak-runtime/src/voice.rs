@@ -48,6 +48,7 @@ const VOICE_NOISE_GATE_FLOOR_SLOW: f32 = 0.006;
 const VOICE_NOISE_GATE_HOLD_MS: usize = 420;
 const VOICE_PROFILE_UPGRADE_AFTER: Duration = Duration::from_secs(2);
 const VOICE_PROFILE_UPGRADE_COOLDOWN: Duration = Duration::from_secs(2);
+const VOICE_PROFILE_UPGRADE_PROPOSAL_TIMEOUT: Duration = Duration::from_secs(10);
 const VOICE_PROFILE_DOWNGRADE_COOLDOWN: Duration = Duration::from_secs(6);
 const VOICE_PROFILE_DROPPED_FRAME_THRESHOLD: usize = 4;
 const VOICE_PROFILE_PLAYBACK_UNDERRUN_THRESHOLD_SAMPLES: u64 = 2_400;
@@ -1858,19 +1859,22 @@ impl VoiceProfileNegotiation {
 
         self.sync(link_id, role, current, now);
 
-        if let Some(reason) = self.congestion_trigger()
-            && self.can_switch(now, self.downgrade_cooldown(reason))
-            && let Some(profile) = congested_downgrade_profile(current, self.link_graduated)
+        if self.pending_proposal.is_some()
+            && self.last_switch_at.is_some_and(|sent| {
+                now.saturating_duration_since(sent) >= VOICE_PROFILE_UPGRADE_PROPOSAL_TIMEOUT
+            })
         {
             self.pending_proposal = None;
-            self.remote_proposal = None;
-            return Some(VoiceProfileAction::SwitchProfile { profile, reason });
         }
 
-        if self.dropped_since_switch > 0
-            || self.transport_pressure > 0
-            || self.playback_underrun_samples_since_switch > 0
-        {
+        if let Some(reason) = self.congestion_trigger() {
+            if self.can_switch(now, self.downgrade_cooldown(reason))
+                && let Some(profile) = congested_downgrade_profile(current, self.link_graduated)
+            {
+                self.pending_proposal = None;
+                self.remote_proposal = None;
+                return Some(VoiceProfileAction::SwitchProfile { profile, reason });
+            }
             return None;
         }
 
@@ -2634,7 +2638,9 @@ async fn start_android_speaker_side(
             let now = Instant::now();
             let gap = now.saturating_duration_since(last_frame_at);
             if gap > frame_period + frame_period / 2 {
-                let missed_frames = gap.as_millis() / frame_period.as_millis().max(1);
+                let frame_ms = frame_period.as_millis().max(1) as u64;
+                let gap_ms = gap.as_millis() as u64;
+                let missed_frames = gap_ms / frame_ms;
                 if missed_frames > 1 {
                     health.record_underrun_samples((missed_frames - 1) * samples_per_frame);
                 }
@@ -3814,7 +3820,7 @@ mod tests {
             Profile::BandwidthVeryLow,
             Profile::BandwidthLow,
         );
-        negotiation.record_playback_underruns(link_id, 1);
+        negotiation.record_playback_underruns(link_id, playback_underrun_threshold_samples());
         assert_eq!(
             next_accept_profile(
                 &mut negotiation,
@@ -4043,7 +4049,7 @@ mod tests {
             Profile::BandwidthVeryLow,
             stable_since,
         );
-        negotiation.record_playback_underruns(link_id, 1);
+        negotiation.record_playback_underruns(link_id, playback_underrun_threshold_samples());
         assert_eq!(
             next_propose_profile(
                 &mut negotiation,
@@ -4052,6 +4058,32 @@ mod tests {
                 Profile::BandwidthVeryLow,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn isolated_dropped_frames_do_not_block_upgrade_proposal() {
+        let link_id = [0x4e; 16];
+        let mut negotiation = VoiceProfileNegotiation::new();
+        let stable_since = Instant::now()
+            - VOICE_PROFILE_UPGRADE_AFTER
+            - Duration::from_millis(1);
+
+        negotiation.seed_stable_clock(
+            link_id,
+            CallRole::Incoming,
+            Profile::BandwidthVeryLow,
+            stable_since,
+        );
+        negotiation.record_receive(link_id, VOICE_PROFILE_DROPPED_FRAME_THRESHOLD - 1);
+        assert_eq!(
+            next_propose_profile(
+                &mut negotiation,
+                link_id,
+                CallRole::Incoming,
+                Profile::BandwidthVeryLow,
+            ),
+            Some(Profile::BandwidthLow)
         );
     }
 
