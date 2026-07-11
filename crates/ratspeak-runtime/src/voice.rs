@@ -46,10 +46,10 @@ const VOICE_NOISE_GATE_RELEASE: f32 = 0.06;
 const VOICE_NOISE_GATE_FLOOR_FAST: f32 = 0.06;
 const VOICE_NOISE_GATE_FLOOR_SLOW: f32 = 0.006;
 const VOICE_NOISE_GATE_HOLD_MS: usize = 420;
-const VOICE_PROFILE_UPGRADE_AFTER: Duration = Duration::from_secs(3);
+const VOICE_PROFILE_UPGRADE_AFTER: Duration = Duration::from_secs(2);
 const VOICE_PROFILE_UPGRADE_COOLDOWN: Duration = Duration::from_secs(2);
 const VOICE_PROFILE_DOWNGRADE_COOLDOWN: Duration = Duration::from_secs(6);
-const VOICE_PROFILE_UPGRADE_LOCKOUT_AFTER_DOWNGRADE: Duration = Duration::from_secs(20);
+const VOICE_PROFILE_PERMISSION_AFTER: Duration = Duration::from_secs(3);
 const VOICE_PROFILE_DROPPED_FRAME_THRESHOLD: usize = 4;
 const VOICE_PROFILE_RECEIVE_STALL_AFTER: Duration = Duration::from_secs(3);
 const VOICE_PROFILE_TRANSPORT_PRESSURE_THRESHOLD: usize = 1;
@@ -865,7 +865,7 @@ async fn drive_voice_events(
 ) {
     let mut audio_session: Option<VoiceAudioSession> = None;
     let mut audio_failure: Option<VoiceAudioFailure> = None;
-    let mut profile_adaptation = VoiceProfileAdaptation::new();
+    let mut profile_negotiation = VoiceProfileNegotiation::new();
     let mut latest_snapshot: Option<TelephonyRuntimeSnapshot> = None;
     let mut suppressed_call_links: HashSet<[u8; 16]> = HashSet::new();
     let mut audio_recovery_tick = tokio::time::interval(VOICE_AUDIO_RECOVERY_TICK);
@@ -896,7 +896,7 @@ async fn drive_voice_events(
                         &state,
                         &control_tx,
                         snapshot,
-                        &mut profile_adaptation,
+                        &mut profile_negotiation,
                     )
                     .await;
                     reconcile_audio_session(
@@ -1042,7 +1042,7 @@ async fn drive_voice_events(
                 }
                 stop_audio_session(audio_session.take(), &control_tx).await;
                 audio_failure = None;
-                profile_adaptation.reset();
+                profile_negotiation.reset();
                 latest_snapshot = None;
                 state.emit_to_all(
                     "voice_call_update",
@@ -1073,9 +1073,9 @@ async fn drive_voice_events(
                     continue;
                 }
                 latest_snapshot = Some(snapshot.clone());
-                maybe_adapt_voice_profile(&state, &control_tx, &snapshot, &mut profile_adaptation)
+                maybe_adapt_voice_profile(&state, &control_tx, &snapshot, &mut profile_negotiation)
                     .await;
-                if profile_switch_pending(&profile_adaptation, &snapshot) {
+                if profile_switch_pending(&profile_negotiation, &snapshot) {
                     stop_audio_session(audio_session.take(), &control_tx).await;
                     audio_failure = None;
                 } else {
@@ -1129,15 +1129,15 @@ async fn drive_voice_events(
                 dropped,
             } => {
                 if frames > 0 {
-                    profile_adaptation.record_inbound_media(link_id);
+                    profile_negotiation.record_inbound_media(link_id);
                 }
-                profile_adaptation.record_receive(link_id, dropped);
+                profile_negotiation.record_receive(link_id, dropped);
                 if let Some(snapshot) = latest_snapshot.as_ref() {
                     maybe_adapt_voice_profile(
                         &state,
                         &control_tx,
                         snapshot,
-                        &mut profile_adaptation,
+                        &mut profile_negotiation,
                     )
                     .await;
                 }
@@ -1191,15 +1191,15 @@ async fn drive_voice_events(
                 dropped,
             } => {
                 if frames > 0 {
-                    profile_adaptation.record_inbound_media(link_id);
+                    profile_negotiation.record_inbound_media(link_id);
                 }
-                profile_adaptation.record_receive(link_id, dropped);
+                profile_negotiation.record_receive(link_id, dropped);
                 if let Some(snapshot) = latest_snapshot.as_ref() {
                     maybe_adapt_voice_profile(
                         &state,
                         &control_tx,
                         snapshot,
-                        &mut profile_adaptation,
+                        &mut profile_negotiation,
                     )
                     .await;
                 }
@@ -1220,13 +1220,13 @@ async fn drive_voice_events(
                         .as_ref()
                         .and_then(|snapshot| snapshot.active_call.as_ref())
                 {
-                    profile_adaptation.record_transport_pressure(active.link_id);
+                    profile_negotiation.record_transport_pressure(active.link_id);
                     if let Some(snapshot) = latest_snapshot.as_ref() {
                         maybe_adapt_voice_profile(
                             &state,
                             &control_tx,
                             snapshot,
-                            &mut profile_adaptation,
+                            &mut profile_negotiation,
                         )
                         .await;
                     }
@@ -1241,13 +1241,13 @@ async fn drive_voice_events(
                 emit_lxst_activity(&state, "LXST voice error", &message, "standard");
             }
             TelephonyServiceEvent::MediaReceived { link_id, .. } => {
-                profile_adaptation.record_inbound_media(link_id);
+                profile_negotiation.record_inbound_media(link_id);
                 if let Some(snapshot) = latest_snapshot.as_ref() {
                     maybe_adapt_voice_profile(
                         &state,
                         &control_tx,
                         snapshot,
-                        &mut profile_adaptation,
+                        &mut profile_negotiation,
                     )
                     .await;
                 }
@@ -1258,14 +1258,26 @@ async fn drive_voice_events(
                         &state,
                         &control_tx,
                         snapshot,
-                        &mut profile_adaptation,
+                        &mut profile_negotiation,
+                    )
+                    .await;
+                }
+            }
+            TelephonyServiceEvent::UpgradePermissionReceived { link_id } => {
+                profile_negotiation.record_upgrade_permission(link_id);
+                if let Some(snapshot) = latest_snapshot.as_ref() {
+                    maybe_adapt_voice_profile(
+                        &state,
+                        &control_tx,
+                        snapshot,
+                        &mut profile_negotiation,
                     )
                     .await;
                 }
             }
             TelephonyServiceEvent::Stopped => {
                 stop_audio_session(audio_session.take(), &control_tx).await;
-                profile_adaptation.reset();
+                profile_negotiation.reset();
                 state.emit_to_all(
                     "voice_call_update",
                     json!({
@@ -1443,60 +1455,88 @@ async fn maybe_adapt_voice_profile(
     state: &AppState,
     control_tx: &mpsc::Sender<TelephonyControl>,
     snapshot: &TelephonyRuntimeSnapshot,
-    adaptation: &mut VoiceProfileAdaptation,
+    negotiation: &mut VoiceProfileNegotiation,
 ) -> bool {
     let Some(active) = snapshot.active_call.as_ref() else {
-        adaptation.reset();
+        negotiation.reset();
         return false;
     };
 
     if active.status != SignallingStatus::Established {
-        adaptation.reset_for_link(active.link_id);
+        negotiation.reset_for_link(active.link_id);
         return false;
     }
 
     let current = active.profile.unwrap_or(Profile::DEFAULT);
-    let Some((next, reason)) = adaptation.next_profile(active.link_id, current) else {
+    let Some(action) = negotiation.next_action(active.link_id, active.role, current) else {
         return false;
     };
 
-    if control_tx
-        .send(TelephonyControl::SwitchProfile { profile: next })
-        .await
-        .is_ok()
-    {
-        tracing::info!(
-            link_id = %hex::encode(active.link_id),
-            from = profile_key(current),
-            to = profile_key(next),
-            reason,
-            "switching LXST voice profile"
-        );
-        adaptation.mark_switch(next);
-        state.emit_to_all(
-            "voice_call_update",
-            json!({
-                "type": "profile_adaptation",
-                "link_id": hex::encode(active.link_id),
-                "from": profile_key(current),
-                "to": profile_key(next),
-                "reason": reason,
-            }),
-        );
-        true
-    } else {
-        false
+    match action {
+        VoiceProfileAction::SwitchProfile { profile, reason } => {
+            if control_tx
+                .send(TelephonyControl::SwitchProfile { profile })
+                .await
+                .is_ok()
+            {
+                tracing::info!(
+                    link_id = %hex::encode(active.link_id),
+                    role = role_key(active.role),
+                    from = profile_key(current),
+                    to = profile_key(profile),
+                    reason,
+                    "switching LXST voice profile"
+                );
+                negotiation.mark_switch(profile, active.role);
+                state.emit_to_all(
+                    "voice_call_update",
+                    json!({
+                        "type": "profile_adaptation",
+                        "link_id": hex::encode(active.link_id),
+                        "from": profile_key(current),
+                        "to": profile_key(profile),
+                        "reason": reason,
+                    }),
+                );
+                true
+            } else {
+                false
+            }
+        }
+        VoiceProfileAction::GrantUpgradePermission => {
+            if control_tx
+                .send(TelephonyControl::GrantUpgradePermission)
+                .await
+                .is_ok()
+            {
+                tracing::info!(
+                    link_id = %hex::encode(active.link_id),
+                    "granting LXST voice upgrade permission to callee"
+                );
+                negotiation.mark_permission_sent();
+                state.emit_to_all(
+                    "voice_call_update",
+                    json!({
+                        "type": "upgrade_permission",
+                        "link_id": hex::encode(active.link_id),
+                    }),
+                );
+                true
+            } else {
+                false
+            }
+        }
     }
 }
 
 fn profile_switch_pending(
-    adaptation: &VoiceProfileAdaptation,
+    negotiation: &VoiceProfileNegotiation,
     snapshot: &TelephonyRuntimeSnapshot,
 ) -> bool {
     snapshot.active_call.as_ref().is_some_and(|active| {
         let current = active.profile.unwrap_or(Profile::DEFAULT);
         active.status == SignallingStatus::Established
-            && adaptation.pending_switch(active.link_id, current)
+            && negotiation.pending_switch(active.link_id, current)
     })
 }
 
@@ -1611,28 +1651,44 @@ fn emit_media_state(
     );
 }
 
-struct VoiceProfileAdaptation {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpgradeTokenHolder {
+    Caller,
+    Callee,
+}
+
+enum VoiceProfileAction {
+    SwitchProfile {
+        profile: Profile,
+        reason: &'static str,
+    },
+    GrantUpgradePermission,
+}
+
+struct VoiceProfileNegotiation {
     link_id: Option<[u8; 16]>,
+    token: UpgradeTokenHolder,
     stable_since: Option<Instant>,
     last_switch_at: Option<Instant>,
     current_profile: Option<Profile>,
     requested_profile: Option<Profile>,
-    upgrade_blocked_until: Option<Instant>,
+    permission_sent: bool,
     dropped_since_switch: usize,
     transport_pressure: usize,
     last_inbound_media_at: Option<Instant>,
     link_graduated: bool,
 }
 
-impl VoiceProfileAdaptation {
+impl VoiceProfileNegotiation {
     fn new() -> Self {
         Self {
             link_id: None,
+            token: UpgradeTokenHolder::Callee,
             stable_since: None,
             last_switch_at: None,
             current_profile: None,
             requested_profile: None,
-            upgrade_blocked_until: None,
+            permission_sent: false,
             dropped_since_switch: 0,
             transport_pressure: 0,
             last_inbound_media_at: None,
@@ -1642,11 +1698,12 @@ impl VoiceProfileAdaptation {
 
     fn reset(&mut self) {
         self.link_id = None;
+        self.token = UpgradeTokenHolder::Callee;
         self.stable_since = None;
         self.last_switch_at = None;
         self.current_profile = None;
         self.requested_profile = None;
-        self.upgrade_blocked_until = None;
+        self.permission_sent = false;
         self.dropped_since_switch = 0;
         self.transport_pressure = 0;
         self.last_inbound_media_at = None;
@@ -1658,7 +1715,7 @@ impl VoiceProfileAdaptation {
             self.stable_since = None;
             self.current_profile = None;
             self.requested_profile = None;
-            self.upgrade_blocked_until = None;
+            self.permission_sent = false;
             self.dropped_since_switch = 0;
             self.transport_pressure = 0;
         } else {
@@ -1684,6 +1741,13 @@ impl VoiceProfileAdaptation {
         }
     }
 
+    fn record_upgrade_permission(&mut self, link_id: [u8; 16]) {
+        if self.link_id == Some(link_id) {
+            self.token = UpgradeTokenHolder::Callee;
+            self.permission_sent = false;
+        }
+    }
+
     fn pending_switch(&self, link_id: [u8; 16], current: Profile) -> bool {
         self.link_id == Some(link_id)
             && self
@@ -1691,7 +1755,12 @@ impl VoiceProfileAdaptation {
                 .is_some_and(|requested| requested != current)
     }
 
-    fn next_profile(&mut self, link_id: [u8; 16], current: Profile) -> Option<(Profile, &'static str)> {
+    fn next_action(
+        &mut self,
+        link_id: [u8; 16],
+        role: CallRole,
+        current: Profile,
+    ) -> Option<VoiceProfileAction> {
         if !is_adaptive_voice_profile(current) {
             self.reset_for_link(link_id);
             return None;
@@ -1708,25 +1777,20 @@ impl VoiceProfileAdaptation {
             }
         }
 
-        self.sync(link_id, current, now);
+        self.sync(link_id, role, current, now);
 
         if let Some(reason) = self.congestion_trigger(now)
             && self.can_switch(now, self.downgrade_cooldown(now, reason))
             && let Some(profile) = congested_downgrade_profile(current, self.link_graduated)
         {
-            self.upgrade_blocked_until = Some(
-                now.checked_add(VOICE_PROFILE_UPGRADE_LOCKOUT_AFTER_DOWNGRADE)
-                    .unwrap_or(now),
-            );
-            return Some((profile, reason));
+            return Some(VoiceProfileAction::SwitchProfile { profile, reason });
         }
 
-        if self.dropped_since_switch > 0
-            || self.transport_pressure > 0
-            || self
-                .upgrade_blocked_until
-                .is_some_and(|blocked_until| now < blocked_until)
-        {
+        if self.dropped_since_switch > 0 || self.transport_pressure > 0 {
+            return None;
+        }
+
+        if receive_stalled_at(self.last_inbound_media_at, now) {
             return None;
         }
 
@@ -1735,11 +1799,25 @@ impl VoiceProfileAdaptation {
             .map(|stable_since| now.saturating_duration_since(stable_since))
             .unwrap_or_default();
 
-        if stable_for >= VOICE_PROFILE_UPGRADE_AFTER
+        if role == CallRole::Outgoing
+            && self.token == UpgradeTokenHolder::Caller
+            && !self.permission_sent
+            && stable_for >= VOICE_PROFILE_PERMISSION_AFTER
+            && self.can_switch(now, VOICE_PROFILE_UPGRADE_COOLDOWN)
+        {
+            return Some(VoiceProfileAction::GrantUpgradePermission);
+        }
+
+        if role == CallRole::Incoming
+            && self.token == UpgradeTokenHolder::Callee
+            && stable_for >= VOICE_PROFILE_UPGRADE_AFTER
             && self.can_switch(now, VOICE_PROFILE_UPGRADE_COOLDOWN)
             && let Some(profile) = stable_upgrade_profile(current)
         {
-            return Some((profile, "stable_link"));
+            return Some(VoiceProfileAction::SwitchProfile {
+                profile,
+                reason: "stable_link",
+            });
         }
 
         None
@@ -1766,7 +1844,7 @@ impl VoiceProfileAdaptation {
         }
     }
 
-    fn mark_switch(&mut self, profile: Profile) {
+    fn mark_switch(&mut self, profile: Profile, role: CallRole) {
         let now = Instant::now();
         if profile == Profile::BandwidthVeryLow {
             self.link_graduated = false;
@@ -1776,6 +1854,15 @@ impl VoiceProfileAdaptation {
         {
             self.link_graduated = true;
         }
+
+        if self
+            .current_profile
+            .is_some_and(|previous| profile_bandwidth_rank(profile) < profile_bandwidth_rank(previous))
+        {
+            self.token = local_token_holder(role);
+            self.permission_sent = false;
+        }
+
         self.current_profile = Some(profile);
         self.requested_profile = Some(profile);
         self.stable_since = Some(now);
@@ -1785,13 +1872,20 @@ impl VoiceProfileAdaptation {
         self.last_inbound_media_at = Some(now);
     }
 
-    fn sync(&mut self, link_id: [u8; 16], profile: Profile, now: Instant) {
+    fn mark_permission_sent(&mut self) {
+        self.token = UpgradeTokenHolder::Callee;
+        self.permission_sent = true;
+        self.stable_since = Some(Instant::now());
+    }
+
+    fn sync(&mut self, link_id: [u8; 16], role: CallRole, profile: Profile, now: Instant) {
         if self.link_id != Some(link_id) {
             self.link_id = Some(link_id);
+            self.token = UpgradeTokenHolder::Callee;
             self.stable_since = Some(now);
             self.current_profile = Some(profile);
             self.requested_profile = None;
-            self.upgrade_blocked_until = None;
+            self.permission_sent = false;
             self.dropped_since_switch = 0;
             self.transport_pressure = 0;
             self.last_inbound_media_at = Some(now);
@@ -1799,6 +1893,14 @@ impl VoiceProfileAdaptation {
         }
 
         if self.current_profile != Some(profile) {
+            if self.requested_profile.is_none() {
+                if let Some(previous) = self.current_profile {
+                    if profile_bandwidth_rank(profile) < profile_bandwidth_rank(previous) {
+                        self.token = peer_token_holder(role);
+                        self.permission_sent = false;
+                    }
+                }
+            }
             self.current_profile = Some(profile);
             self.requested_profile = None;
             self.stable_since = Some(now);
@@ -1820,14 +1922,51 @@ impl VoiceProfileAdaptation {
     }
 
     #[cfg(test)]
-    fn seed_inbound_media_clock(&mut self, link_id: [u8; 16], profile: Profile, media_at: Instant) {
-        self.sync(link_id, profile, media_at);
+    fn seed_inbound_media_clock(
+        &mut self,
+        link_id: [u8; 16],
+        role: CallRole,
+        profile: Profile,
+        media_at: Instant,
+    ) {
+        self.sync(link_id, role, profile, media_at);
         self.last_inbound_media_at = Some(media_at);
     }
 
     #[cfg(test)]
     fn link_graduated(&self) -> bool {
         self.link_graduated
+    }
+
+    #[cfg(test)]
+    fn token(&self) -> UpgradeTokenHolder {
+        self.token
+    }
+}
+
+fn local_token_holder(role: CallRole) -> UpgradeTokenHolder {
+    match role {
+        CallRole::Outgoing => UpgradeTokenHolder::Caller,
+        CallRole::Incoming => UpgradeTokenHolder::Callee,
+    }
+}
+
+fn peer_token_holder(role: CallRole) -> UpgradeTokenHolder {
+    match role {
+        CallRole::Outgoing => UpgradeTokenHolder::Callee,
+        CallRole::Incoming => UpgradeTokenHolder::Caller,
+    }
+}
+
+fn profile_bandwidth_rank(profile: Profile) -> u8 {
+    match profile {
+        Profile::BandwidthUltraLow => 0,
+        Profile::BandwidthVeryLow => 1,
+        Profile::BandwidthLow => 2,
+        Profile::QualityMedium => 3,
+        Profile::QualityHigh => 4,
+        Profile::QualityMax => 5,
+        Profile::LatencyLow | Profile::LatencyUltraLow => u8::MAX,
     }
 }
 
@@ -3395,28 +3534,154 @@ mod tests {
         assert_eq!(VOICE_INITIAL_PROFILE, Profile::BandwidthVeryLow);
     }
 
+    fn next_switch_profile(
+        negotiation: &mut VoiceProfileNegotiation,
+        link_id: [u8; 16],
+        role: CallRole,
+        current: Profile,
+    ) -> Option<(Profile, &'static str)> {
+        match negotiation.next_action(link_id, role, current)? {
+            VoiceProfileAction::SwitchProfile { profile, reason } => Some((profile, reason)),
+            VoiceProfileAction::GrantUpgradePermission => None,
+        }
+    }
+
+    fn wants_upgrade_permission(
+        negotiation: &mut VoiceProfileNegotiation,
+        link_id: [u8; 16],
+        role: CallRole,
+        current: Profile,
+    ) -> bool {
+        matches!(
+            negotiation.next_action(link_id, role, current),
+            Some(VoiceProfileAction::GrantUpgradePermission)
+        )
+    }
+
     #[test]
-    fn profile_adaptation_upgrades_after_stable_period() {
+    fn profile_negotiation_upgrades_after_stable_period() {
         let link_id = [0x48; 16];
-        let mut adaptation = VoiceProfileAdaptation::new();
+        let mut negotiation = VoiceProfileNegotiation::new();
         let stable_since = Instant::now()
             - VOICE_PROFILE_UPGRADE_AFTER
             - Duration::from_millis(1);
 
-        adaptation.seed_inbound_media_clock(link_id, Profile::BandwidthVeryLow, stable_since);
+        negotiation.seed_inbound_media_clock(
+            link_id,
+            CallRole::Incoming,
+            Profile::BandwidthVeryLow,
+            stable_since,
+        );
         assert_eq!(
-            adaptation.next_profile(link_id, Profile::BandwidthVeryLow),
+            next_switch_profile(
+                &mut negotiation,
+                link_id,
+                CallRole::Incoming,
+                Profile::BandwidthVeryLow,
+            ),
             Some((Profile::BandwidthLow, "stable_link"))
         );
     }
 
     #[test]
-    fn profile_adaptation_waits_before_upgrading() {
+    fn profile_negotiation_waits_before_upgrading() {
         let link_id = [0x42; 16];
-        let mut adaptation = VoiceProfileAdaptation::new();
+        let mut negotiation = VoiceProfileNegotiation::new();
 
-        assert_eq!(adaptation.next_profile(link_id, Profile::QualityMedium), None);
-        assert_eq!(adaptation.next_profile(link_id, Profile::BandwidthVeryLow), None);
+        assert_eq!(
+            next_switch_profile(
+                &mut negotiation,
+                link_id,
+                CallRole::Incoming,
+                Profile::BandwidthVeryLow,
+            ),
+            None
+        );
+        assert_eq!(
+            next_switch_profile(
+                &mut negotiation,
+                link_id,
+                CallRole::Outgoing,
+                Profile::QualityMedium,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn caller_does_not_upgrade_without_token() {
+        let link_id = [0x49; 16];
+        let mut negotiation = VoiceProfileNegotiation::new();
+        let stable_since = Instant::now()
+            - VOICE_PROFILE_UPGRADE_AFTER
+            - Duration::from_millis(1);
+
+        negotiation.seed_inbound_media_clock(
+            link_id,
+            CallRole::Outgoing,
+            Profile::BandwidthVeryLow,
+            stable_since,
+        );
+        assert_eq!(
+            next_switch_profile(
+                &mut negotiation,
+                link_id,
+                CallRole::Outgoing,
+                Profile::BandwidthVeryLow,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn callee_waits_for_upgrade_token_after_caller_downgrade() {
+        let link_id = [0x4a; 16];
+        let mut negotiation = VoiceProfileNegotiation::new();
+        let stable_since = Instant::now()
+            - VOICE_PROFILE_UPGRADE_AFTER
+            - Duration::from_millis(1);
+
+        negotiation.seed_inbound_media_clock(
+            link_id,
+            CallRole::Incoming,
+            Profile::BandwidthVeryLow,
+            stable_since,
+        );
+        negotiation.token = UpgradeTokenHolder::Caller;
+        assert_eq!(
+            next_switch_profile(
+                &mut negotiation,
+                link_id,
+                CallRole::Incoming,
+                Profile::BandwidthVeryLow,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn caller_grants_permission_after_stable_period() {
+        let link_id = [0x4b; 16];
+        let mut negotiation = VoiceProfileNegotiation::new();
+        let stable_since = Instant::now()
+            - VOICE_PROFILE_PERMISSION_AFTER
+            - Duration::from_millis(1);
+
+        negotiation.sync(
+            link_id,
+            CallRole::Outgoing,
+            Profile::BandwidthVeryLow,
+            stable_since,
+        );
+        negotiation.stable_since = Some(stable_since);
+        negotiation.last_inbound_media_at = Some(Instant::now());
+        negotiation.token = UpgradeTokenHolder::Caller;
+        assert!(wants_upgrade_permission(
+            &mut negotiation,
+            link_id,
+            CallRole::Outgoing,
+            Profile::BandwidthVeryLow,
+        ));
     }
 
     #[test]
@@ -3455,27 +3720,53 @@ mod tests {
     }
 
     #[test]
-    fn profile_adaptation_downgrades_on_dropped_frames() {
+    fn profile_negotiation_downgrades_on_dropped_frames() {
         let link_id = [0x42; 16];
-        let mut adaptation = VoiceProfileAdaptation::new();
+        let mut negotiation = VoiceProfileNegotiation::new();
 
-        assert_eq!(adaptation.next_profile(link_id, Profile::QualityHigh), None);
-        adaptation.record_receive(link_id, VOICE_PROFILE_DROPPED_FRAME_THRESHOLD);
         assert_eq!(
-            adaptation.next_profile(link_id, Profile::QualityHigh),
+            next_switch_profile(
+                &mut negotiation,
+                link_id,
+                CallRole::Outgoing,
+                Profile::QualityHigh,
+            ),
+            None
+        );
+        negotiation.record_receive(link_id, VOICE_PROFILE_DROPPED_FRAME_THRESHOLD);
+        assert_eq!(
+            next_switch_profile(
+                &mut negotiation,
+                link_id,
+                CallRole::Outgoing,
+                Profile::QualityHigh,
+            ),
             Some((Profile::BandwidthVeryLow, "dropped_frames"))
         );
     }
 
     #[test]
-    fn profile_adaptation_downgrades_on_transport_pressure() {
+    fn profile_negotiation_downgrades_on_transport_pressure() {
         let link_id = [0x46; 16];
-        let mut adaptation = VoiceProfileAdaptation::new();
+        let mut negotiation = VoiceProfileNegotiation::new();
 
-        assert_eq!(adaptation.next_profile(link_id, Profile::QualityHigh), None);
-        adaptation.record_transport_pressure(link_id);
         assert_eq!(
-            adaptation.next_profile(link_id, Profile::QualityHigh),
+            next_switch_profile(
+                &mut negotiation,
+                link_id,
+                CallRole::Incoming,
+                Profile::QualityHigh,
+            ),
+            None
+        );
+        negotiation.record_transport_pressure(link_id);
+        assert_eq!(
+            next_switch_profile(
+                &mut negotiation,
+                link_id,
+                CallRole::Incoming,
+                Profile::QualityHigh,
+            ),
             Some((Profile::BandwidthVeryLow, "transport_pressure"))
         );
     }
@@ -3492,17 +3783,30 @@ mod tests {
     }
 
     #[test]
-    fn profile_adaptation_downgrades_on_receive_stall() {
+    fn profile_negotiation_downgrades_on_receive_stall() {
         let link_id = [0x47; 16];
-        let mut adaptation = VoiceProfileAdaptation::new();
+        let mut negotiation = VoiceProfileNegotiation::new();
         let stale = Instant::now()
             - VOICE_PROFILE_RECEIVE_STALL_AFTER
             - Duration::from_millis(1);
 
-        assert_eq!(adaptation.next_profile(link_id, Profile::QualityHigh), None);
-        adaptation.seed_inbound_media_clock(link_id, Profile::QualityHigh, stale);
         assert_eq!(
-            adaptation.next_profile(link_id, Profile::QualityHigh),
+            next_switch_profile(
+                &mut negotiation,
+                link_id,
+                CallRole::Outgoing,
+                Profile::QualityHigh,
+            ),
+            None
+        );
+        negotiation.seed_inbound_media_clock(link_id, CallRole::Outgoing, Profile::QualityHigh, stale);
+        assert_eq!(
+            next_switch_profile(
+                &mut negotiation,
+                link_id,
+                CallRole::Outgoing,
+                Profile::QualityHigh,
+            ),
             Some((Profile::BandwidthVeryLow, "receive_stall"))
         );
     }
@@ -3533,38 +3837,67 @@ mod tests {
 
     #[test]
     fn mark_switch_tracks_graduated_link_after_codec2_climb() {
-        let mut adaptation = VoiceProfileAdaptation::new();
+        let mut negotiation = VoiceProfileNegotiation::new();
 
-        adaptation.mark_switch(Profile::BandwidthVeryLow);
-        assert!(!adaptation.link_graduated());
-        adaptation.mark_switch(Profile::BandwidthLow);
-        assert!(adaptation.link_graduated());
-        adaptation.mark_switch(Profile::QualityHigh);
-        assert!(adaptation.link_graduated());
-        adaptation.mark_switch(Profile::BandwidthVeryLow);
-        assert!(!adaptation.link_graduated());
+        negotiation.mark_switch(Profile::BandwidthVeryLow, CallRole::Incoming);
+        assert!(!negotiation.link_graduated());
+        negotiation.mark_switch(Profile::BandwidthLow, CallRole::Incoming);
+        assert!(negotiation.link_graduated());
+        negotiation.mark_switch(Profile::QualityHigh, CallRole::Incoming);
+        assert!(negotiation.link_graduated());
+        negotiation.mark_switch(Profile::BandwidthVeryLow, CallRole::Incoming);
+        assert!(!negotiation.link_graduated());
     }
 
     #[test]
-    fn profile_adaptation_downgrades_codec2_when_congested() {
-        let link_id = [0x43; 16];
-        let mut adaptation = VoiceProfileAdaptation::new();
+    fn local_downgrade_moves_token_to_caller_for_outgoing_role() {
+        let mut negotiation = VoiceProfileNegotiation::new();
+        negotiation.mark_switch(Profile::QualityHigh, CallRole::Outgoing);
+        negotiation.mark_switch(Profile::BandwidthVeryLow, CallRole::Outgoing);
+        assert_eq!(negotiation.token(), UpgradeTokenHolder::Caller);
+    }
 
-        assert_eq!(adaptation.next_profile(link_id, Profile::BandwidthLow), None);
-        adaptation.record_receive(link_id, VOICE_PROFILE_DROPPED_FRAME_THRESHOLD);
+    #[test]
+    fn profile_negotiation_downgrades_codec2_when_congested() {
+        let link_id = [0x43; 16];
+        let mut negotiation = VoiceProfileNegotiation::new();
+
         assert_eq!(
-            adaptation.next_profile(link_id, Profile::BandwidthLow),
+            next_switch_profile(
+                &mut negotiation,
+                link_id,
+                CallRole::Incoming,
+                Profile::BandwidthLow,
+            ),
+            None
+        );
+        negotiation.record_receive(link_id, VOICE_PROFILE_DROPPED_FRAME_THRESHOLD);
+        assert_eq!(
+            next_switch_profile(
+                &mut negotiation,
+                link_id,
+                CallRole::Incoming,
+                Profile::BandwidthLow,
+            ),
             Some((Profile::BandwidthVeryLow, "dropped_frames"))
         );
     }
 
     #[test]
-    fn profile_adaptation_ignores_latency_profiles() {
+    fn profile_negotiation_ignores_latency_profiles() {
         let link_id = [0x44; 16];
-        let mut adaptation = VoiceProfileAdaptation::new();
+        let mut negotiation = VoiceProfileNegotiation::new();
 
-        adaptation.record_receive(link_id, VOICE_PROFILE_DROPPED_FRAME_THRESHOLD);
-        assert_eq!(adaptation.next_profile(link_id, Profile::LatencyLow), None);
+        negotiation.record_receive(link_id, VOICE_PROFILE_DROPPED_FRAME_THRESHOLD);
+        assert_eq!(
+            next_switch_profile(
+                &mut negotiation,
+                link_id,
+                CallRole::Outgoing,
+                Profile::LatencyLow,
+            ),
+            None
+        );
     }
 
     #[test]
