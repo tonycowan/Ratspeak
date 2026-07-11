@@ -46,8 +46,8 @@ const VOICE_NOISE_GATE_RELEASE: f32 = 0.06;
 const VOICE_NOISE_GATE_FLOOR_FAST: f32 = 0.06;
 const VOICE_NOISE_GATE_FLOOR_SLOW: f32 = 0.006;
 const VOICE_NOISE_GATE_HOLD_MS: usize = 420;
-const VOICE_PROFILE_UPGRADE_AFTER: Duration = Duration::from_secs(20);
-const VOICE_PROFILE_UPGRADE_COOLDOWN: Duration = Duration::from_secs(20);
+const VOICE_PROFILE_UPGRADE_AFTER: Duration = Duration::from_secs(3);
+const VOICE_PROFILE_UPGRADE_COOLDOWN: Duration = Duration::from_secs(2);
 const VOICE_PROFILE_DOWNGRADE_COOLDOWN: Duration = Duration::from_secs(6);
 const VOICE_PROFILE_UPGRADE_LOCKOUT_AFTER_DOWNGRADE: Duration = Duration::from_secs(20);
 const VOICE_PROFILE_DROPPED_FRAME_THRESHOLD: usize = 4;
@@ -63,7 +63,7 @@ const VOICE_OUTPUT_GAIN: f32 = 1.85;
 const VOICE_CODEC2_OUTPUT_GAIN: f32 = 2.9;
 const VOICE_OUTPUT_LIMIT: f32 = 0.98;
 const VOICE_OUTPUT_LIMIT_CURVE: f32 = 0.35;
-const VOICE_INITIAL_PROFILE: Profile = Profile::QualityHigh;
+const VOICE_INITIAL_PROFILE: Profile = Profile::BandwidthVeryLow;
 
 fn profile_uses_codec2(profile: Profile) -> bool {
     matches!(profile.audio_codec(), AudioCodec::Codec2(_))
@@ -3388,6 +3388,26 @@ mod tests {
         assert!(profile_uses_codec2(Profile::BandwidthVeryLow));
         assert!(!profile_uses_codec2(Profile::QualityHigh));
         assert!(!profile_uses_codec2(Profile::LatencyLow));
+    }
+
+    #[test]
+    fn voice_initial_profile_defaults_to_codec2_1600() {
+        assert_eq!(VOICE_INITIAL_PROFILE, Profile::BandwidthVeryLow);
+    }
+
+    #[test]
+    fn profile_adaptation_upgrades_after_stable_period() {
+        let link_id = [0x48; 16];
+        let mut adaptation = VoiceProfileAdaptation::new();
+        let stable_since = Instant::now()
+            - VOICE_PROFILE_UPGRADE_AFTER
+            - Duration::from_millis(1);
+
+        adaptation.seed_inbound_media_clock(link_id, Profile::BandwidthVeryLow, stable_since);
+        assert_eq!(
+            adaptation.next_profile(link_id, Profile::BandwidthVeryLow),
+            Some((Profile::BandwidthLow, "stable_link"))
+        );
     }
 
     #[test]
