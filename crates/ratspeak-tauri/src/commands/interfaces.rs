@@ -930,6 +930,7 @@ pub async fn api_app_settings(state: State<'_, Arc<AppState>>) -> AppResult<Valu
         "auto_announce_interval": *state.announce_interval_rx.borrow(),
         "announce_ratspeak_usage": state.announce_ratspeak_usage_enabled(),
         "peers_sort": persisted_peers_sort(&state),
+        "voice_quality": state.voice_quality(),
         "hardware_session_timeout": hw_timeout,
     }))
 }
@@ -1014,6 +1015,37 @@ pub async fn set_announce_ratspeak_usage(
         }),
     );
     Ok(json!({ "enabled": enabled }))
+}
+
+#[tauri::command]
+pub async fn set_voice_quality(
+    state: State<'_, Arc<AppState>>,
+    quality: String,
+) -> AppResult<Value> {
+    let normalized = crate::state::normalize_voice_quality(&quality).ok_or_else(|| {
+        AppError::bad_request("voice quality must be auto | high | medium | low | very_low")
+    })?;
+    let persisted = normalized.to_string();
+
+    db::spawn_db(state.db.clone(), move |p| {
+        db::try_set_setting(&p, "voice_quality", &persisted)
+    })
+    .await
+    .map_err(|_| AppError::internal("set_voice_quality db task panicked"))?
+    .map_err(|e| AppError::database_unavailable(format!("Failed to save voice quality: {e}")))?;
+
+    state.set_voice_quality(normalized);
+    state.emit_to_all(
+        "app_settings_updated",
+        json!({
+            "voice_quality": normalized,
+            "auto_announce_interval": *state.announce_interval_rx.borrow(),
+            "announce_ratspeak_usage": state.announce_ratspeak_usage_enabled(),
+            "peers_sort": persisted_peers_sort(&state),
+        }),
+    );
+    tracing::info!("Voice quality set to {normalized}");
+    Ok(json!({ "voice_quality": normalized }))
 }
 
 #[tauri::command]

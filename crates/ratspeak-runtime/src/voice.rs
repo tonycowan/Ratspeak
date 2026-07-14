@@ -79,19 +79,30 @@ fn voice_output_gain(profile: Profile) -> f32 {
     }
 }
 
-fn voice_initial_profile() -> Profile {
-    voice_profile_from_env().unwrap_or(VOICE_INITIAL_PROFILE)
+fn voice_initial_profile(state: &AppState) -> Profile {
+    if let Some(profile) = voice_profile_from_env() {
+        return profile;
+    }
+    match state.voice_quality().as_str() {
+        "high" => Profile::QualityHigh,
+        "medium" => Profile::QualityMedium,
+        "low" => Profile::BandwidthLow,
+        "very_low" => Profile::BandwidthVeryLow,
+        _ => VOICE_INITIAL_PROFILE,
+    }
 }
 
 fn snapshot_voice_profile(profile: Option<Profile>) -> Profile {
     profile.unwrap_or(VOICE_INITIAL_PROFILE)
 }
 
-fn voice_profile_source() -> &'static str {
+fn voice_profile_source(state: &AppState) -> &'static str {
     if voice_profile_from_env().is_some() {
         "env"
-    } else {
+    } else if state.voice_quality_is_auto() {
         "default"
+    } else {
+        "setting"
     }
 }
 
@@ -122,13 +133,14 @@ fn voice_profile_label(profile: Profile) -> &'static str {
     }
 }
 
-fn voice_profile_status_fields(profile: Profile) -> Value {
+fn voice_profile_status_fields(state: &AppState, profile: Profile) -> Value {
     json!({
         "default_profile": profile_key(profile),
         "profile_label": voice_profile_label(profile),
         "codec": voice_profile_codec_kind(profile),
         "codec_detail": voice_profile_codec_detail(profile),
-        "profile_source": voice_profile_source(),
+        "profile_source": voice_profile_source(state),
+        "voice_quality": state.voice_quality(),
     })
 }
 
@@ -340,13 +352,13 @@ pub fn voice_status(state: &AppState) -> Value {
         .lock()
         .map(|voice| voice.is_some())
         .unwrap_or(false);
-    let profile = voice_initial_profile();
+    let profile = voice_initial_profile(state);
     let mut status = json!({
         "enabled": true,
         "running": running,
         "microphone_muted": microphone_muted(),
     });
-    if let Value::Object(fields) = voice_profile_status_fields(profile) {
+    if let Value::Object(fields) = voice_profile_status_fields(state, profile) {
         if let Value::Object(status_map) = &mut status {
             status_map.extend(fields);
         }
@@ -390,12 +402,12 @@ pub async fn call_identity(state: &Arc<AppState>, remote_identity: [u8; 16]) -> 
         state,
         TelephonyControl::Call {
             remote_identity,
-            profile: Some(voice_initial_profile()),
+            profile: Some(voice_initial_profile(state)),
             discovery_timeout: Duration::from_secs(15),
         },
     )
     .await?;
-    let profile = voice_initial_profile();
+    let profile = voice_initial_profile(state);
     Ok(json!({
         "ok": true,
         "remote_identity": hex::encode(remote_identity),
@@ -1489,6 +1501,9 @@ async fn maybe_adapt_voice_profile(
     negotiation: &mut VoiceProfileNegotiation,
     audio_session: Option<&VoiceAudioSession>,
 ) -> bool {
+    if !state.voice_quality_is_auto() {
+        return false;
+    }
     collect_playback_underruns(negotiation, audio_session);
     let Some(active) = snapshot.active_call.as_ref() else {
         negotiation.reset();
@@ -4351,13 +4366,17 @@ mod tests {
         assert_eq!(voice_profile_label(Profile::QualityHigh), "Opus HQ");
         assert_eq!(voice_profile_codec_kind(Profile::QualityHigh), "opus");
         assert_eq!(voice_profile_codec_detail(Profile::QualityHigh), "HQ");
+        assert_eq!(profile_key(Profile::BandwidthLow), "bandwidth_low");
+    }
 
-        let fields = voice_profile_status_fields(Profile::BandwidthLow);
-        assert_eq!(fields["default_profile"], "bandwidth_low");
-        assert_eq!(fields["profile_label"], "Codec2 3200");
-        assert_eq!(fields["codec"], "codec2");
-        assert_eq!(fields["codec_detail"], "3200");
-        assert!(fields["profile_source"].is_string());
+    #[test]
+    fn voice_quality_setting_maps_to_fixed_profiles() {
+        assert_eq!(
+            crate::state::normalize_voice_quality("Very-Low"),
+            Some("very_low")
+        );
+        assert_eq!(crate::state::normalize_voice_quality("auto"), Some("auto"));
+        assert_eq!(crate::state::normalize_voice_quality("nope"), None);
     }
 
     #[test]

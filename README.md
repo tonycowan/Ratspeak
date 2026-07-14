@@ -116,17 +116,18 @@ links — no servers, no relays. The stack is new and intentionally narrow:
 
 ### Adaptive quality
 
-Calls start at **Codec2 1600** so narrowband mesh paths work from the first
-frame. When the link stays healthy, Ratspeak climbs quality in steps — both
-sides must agree before each step:
+**Auto** (Settings → Network → Voice Quality) starts calls at **Codec2 1600**
+so narrowband mesh paths work from the first frame. When the link stays healthy,
+Ratspeak climbs quality in steps — both sides must agree before each step:
 
 ```text
 Codec2 1600 → Codec2 3200 → Opus MQ → Opus HQ
 ```
 
 Automatic climbing stops at Opus HQ (mono, ~16 kbps). Opus Max is not part of
-the adaptive ladder; use `RATSPEAK_VOICE_PROFILE` only if you want to pin or
-override the profile manually.
+the adaptive ladder. Choose **High / Medium / Low / Very Low** to pin a fixed
+profile with no climbing (recommended for LoRa / RNode), or set
+`RATSPEAK_VOICE_PROFILE` to override the start profile manually.
 
 | | |
 | --- | --- |

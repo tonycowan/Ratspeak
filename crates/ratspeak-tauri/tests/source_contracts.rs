@@ -67,17 +67,36 @@ fn privacy_announce_usage_setting_is_wired() {
     assert!(settings_js.contains("set_announce_ratspeak_usage"));
     assert!(settings_js.contains("auto_announce_interval"));
     assert!(settings_js.contains("announce_ratspeak_usage"));
+    assert!(settings_js.contains("set_voice_quality"));
+    assert!(settings_js.contains("voice_quality"));
+    assert!(settings_js.contains("voice-quality-select"));
+    assert!(index.contains("Voice Quality"));
+    assert!(index.contains("id=\"voice-quality-select\""));
 
     let interfaces_rs = read_source(root.join("crates/ratspeak-tauri/src/commands/interfaces.rs"))
         .expect("interfaces commands");
     assert!(interfaces_rs.contains("pub async fn api_app_settings"));
     assert!(interfaces_rs.contains("\"auto_announce_interval\""));
     assert!(interfaces_rs.contains("\"announce_ratspeak_usage\""));
+    assert!(interfaces_rs.contains("\"voice_quality\""));
     assert!(interfaces_rs.contains("db::try_set_setting(&p, \"announce_ratspeak_usage\""));
+    assert!(interfaces_rs.contains("pub async fn set_voice_quality"));
+    assert!(interfaces_rs.contains("db::try_set_setting(&p, \"voice_quality\""));
 
     let tauri_lib = read_source(root.join("src-tauri/src/lib.rs")).expect("tauri lib");
     assert!(tauri_lib.contains("api_app_settings"));
     assert!(tauri_lib.contains("set_announce_ratspeak_usage"));
+    assert!(tauri_lib.contains("set_voice_quality"));
+
+    let state_rs =
+        read_source(root.join("crates/ratspeak-runtime/src/state.rs")).expect("runtime state");
+    assert!(state_rs.contains("pub fn normalize_voice_quality"));
+    assert!(state_rs.contains("pub fn voice_quality_is_auto"));
+
+    let voice_rs =
+        read_source(root.join("crates/ratspeak-runtime/src/voice.rs")).expect("runtime voice");
+    assert!(voice_rs.contains("if !state.voice_quality_is_auto()"));
+    assert!(voice_rs.contains("\"very_low\" => Profile::BandwidthVeryLow"));
 
     let system_rs =
         read_source(root.join("crates/ratspeak-tauri/src/commands/system.rs")).expect("system");
@@ -2118,6 +2137,8 @@ fn settings_information_architecture_groups_one_off_settings() {
         .expect("network settings panel");
     assert!(network_panel.contains(r#"<span class="settings-row-label">Transport Mode</span>"#));
     assert!(network_panel.contains(r#"<span class="settings-row-label">Auto-Announce</span>"#));
+    assert!(network_panel.contains(r#"<span class="settings-row-label">Voice Quality</span>"#));
+    assert!(network_panel.contains(r#"id="voice-quality-select""#));
     assert!(!network_panel.contains("Hardware Key Auto-Lock"));
 
     assert!(

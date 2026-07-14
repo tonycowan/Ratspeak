@@ -1271,6 +1271,48 @@ RS.listen('auto_announce_updated', function(data) {
     applyAppSettingsPayload({ auto_announce_interval: data && data.interval });
 });
 
+var _voiceQualityLabels = {
+    auto: 'Auto',
+    high: 'High',
+    medium: 'Medium',
+    low: 'Low',
+    very_low: 'Very Low'
+};
+
+function _voiceQualityLabel(value) {
+    var key = (value || 'auto').toString().toLowerCase().replace(/-/g, '_');
+    return _voiceQualityLabels[key] || 'Auto';
+}
+
+var _settingsVoiceQualityBadge = document.getElementById('voice-quality-select');
+if (_settingsVoiceQualityBadge) {
+    function _openVoiceQualityChoice() {
+        rsChoice({
+            title: 'Voice Quality',
+            message: 'Choose a fixed codec tier, or let Ratspeak climb when the link is stable:',
+            choices: [
+                { label: 'Auto', value: 'auto', hint: 'Start at Codec2 1600 and climb toward Opus HQ when both sides agree.' },
+                { label: 'High', value: 'high', hint: 'Opus HQ — best quality; needs a roomy path (WiFi / TCP).' },
+                { label: 'Medium', value: 'medium', hint: 'Opus MQ — balanced quality and bandwidth.' },
+                { label: 'Low', value: 'low', hint: 'Codec2 3200 — modest bandwidth.' },
+                { label: 'Very Low', value: 'very_low', hint: 'Codec2 1600 — safest for LoRa / RNode; no automatic climbing.' }
+            ]
+        }).then(function(val) {
+            if (val === null || val === undefined) return;
+            _settingsVoiceQualityBadge.textContent = _voiceQualityLabel(val);
+            _settingsVoiceQualityBadge.setAttribute('data-value', val);
+            RS.invoke('set_voice_quality', { quality: val }).catch(function(err) {
+                showToast((err && err.message) || 'Failed to update voice quality', 'toast-red', 8000);
+            });
+        });
+    }
+
+    _settingsVoiceQualityBadge.addEventListener('click', _openVoiceQualityChoice);
+    _settingsVoiceQualityBadge.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); _openVoiceQualityChoice(); }
+    });
+}
+
 function applyAppSettingsPayload(data) {
     if (!data) return;
     var badge = document.getElementById('auto-announce-select');
@@ -1279,6 +1321,12 @@ function applyAppSettingsPayload(data) {
         var secs = parseInt(interval, 10);
         badge.textContent = _announceLabel(secs);
         badge.setAttribute('data-value', secs);
+    }
+    var voiceQualityBadge = document.getElementById('voice-quality-select');
+    if (voiceQualityBadge && data.voice_quality !== undefined) {
+        var quality = (data.voice_quality || 'auto').toString();
+        voiceQualityBadge.textContent = _voiceQualityLabel(quality);
+        voiceQualityBadge.setAttribute('data-value', quality);
     }
     var usageToggle = document.getElementById('announce-ratspeak-usage-toggle');
     if (usageToggle && data.announce_ratspeak_usage !== undefined) {

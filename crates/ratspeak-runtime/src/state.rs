@@ -73,6 +73,8 @@ pub struct AppState {
     pub announce_interval_rx: watch::Receiver<u64>,
     /// If true, delivery announces include Ratspeak capability metadata.
     pub announce_ratspeak_usage: AtomicBool,
+    /// Voice call quality preference: `auto` | `high` | `medium` | `low` | `very_low`.
+    pub voice_quality: RwLock<String>,
     /// Eager-wake for the stats poll loop; loop has 750ms debounce cooldown.
     pub poll_now: Arc<tokio::sync::Notify>,
     /// Live BLE-peer count, driven by `BlePeerEvent::Connected/Disconnected`.
@@ -136,6 +138,19 @@ pub struct AppState {
 /// generation — `None` when no identity is active).
 pub type CachedActiveIdentity = (u64, Option<(String, String)>);
 
+pub const DEFAULT_VOICE_QUALITY: &str = "auto";
+
+pub fn normalize_voice_quality(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some("auto"),
+        "high" => Some("high"),
+        "medium" => Some("medium"),
+        "low" => Some("low"),
+        "very_low" | "very-low" => Some("very_low"),
+        _ => None,
+    }
+}
+
 impl AppState {
     pub fn new(
         config: DashboardConfig,
@@ -156,6 +171,9 @@ impl AppState {
                 .and_then(|v| v.parse::<u8>().ok())
                 .map(|v| v != 0)
                 .unwrap_or(true);
+        let initial_voice_quality = crate::db::get_setting(&db, "voice_quality")
+            .and_then(|v| normalize_voice_quality(&v).map(str::to_string))
+            .unwrap_or_else(|| DEFAULT_VOICE_QUALITY.to_string());
 
         let initial_enforce_stamps = crate::db::get_setting(&db, "enforce_stamps")
             .and_then(|v| v.parse::<u8>().ok())
@@ -216,6 +234,7 @@ impl AppState {
             announce_interval_tx,
             announce_interval_rx,
             announce_ratspeak_usage: AtomicBool::new(initial_announce_ratspeak_usage),
+            voice_quality: RwLock::new(initial_voice_quality),
             poll_now: Arc::new(tokio::sync::Notify::new()),
             ble_peer_count: AtomicUsize::new(0),
             ble_peers: std::sync::Mutex::new(std::collections::BTreeMap::new()),
@@ -301,6 +320,23 @@ impl AppState {
     pub fn set_announce_ratspeak_usage_enabled(&self, enabled: bool) {
         self.announce_ratspeak_usage
             .store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn voice_quality(&self) -> String {
+        self.voice_quality
+            .read()
+            .map(|v| v.clone())
+            .unwrap_or_else(|_| DEFAULT_VOICE_QUALITY.to_string())
+    }
+
+    pub fn set_voice_quality(&self, quality: &str) {
+        if let Ok(mut guard) = self.voice_quality.write() {
+            *guard = quality.to_string();
+        }
+    }
+
+    pub fn voice_quality_is_auto(&self) -> bool {
+        self.voice_quality() == "auto"
     }
 
     pub fn bump_identity_session_generation(&self) -> u64 {
